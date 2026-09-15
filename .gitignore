@@ -2,7 +2,6 @@
 __pycache__/
 *.pyc
 .env
-watches.db
 .langgraph_api/
 .agents/skills/
 .claude/skills/
