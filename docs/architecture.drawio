@@ -185,4 +185,232 @@
       </root>
     </mxGraphModel>
   </diagram>
+  <diagram name="Current Architecture (v2)" id="watchagent-arch-v2">
+    <mxGraphModel dx="1400" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="920" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- User -->
+        <mxCell id="user" value="User (terminal)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="300" width="140" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Scheduler loop -->
+        <mxCell id="scheduler" value="watchagent schedule&#10;--interval-minutes N [--notify]&#10;loops forever (Ctrl+C to stop)" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="20" y="420" width="180" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- CLI -->
+        <mxCell id="cli" value="watchagent/cli.py&#10;add / list / check / schedule /&#10;telegram-setup / telegram-test" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="240" y="290" width="200" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- db.py -->
+        <mxCell id="db" value="watchagent/db.py&#10;SQLite CRUD + mark_alerted()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="240" y="480" width="180" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- watches.db -->
+        <mxCell id="sqlite" value="watches.db (SQLite)&#10;watches (+last_alerted_at),&#10;price_history" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="260" y="620" width="140" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- notify.py -->
+        <mxCell id="notify" value="watchagent/notify.py&#10;send_telegram() / discover_chat_ids()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="220" y="770" width="220" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- Telegram -->
+        <mxCell id="telegram" value="Telegram Bot API&#10;sendMessage / getUpdates" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="500" y="770" width="200" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- agent.py -->
+        <mxCell id="agent" value="watchagent/agent.py&#10;build_agent() / check_watch()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="500" y="280" width="200" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- create_agent -->
+        <mxCell id="createagent" value="LangChain create_agent()&#10;system_prompt + response_format=WatchVerdict" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="760" y="280" width="240" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Gemini -->
+        <mxCell id="gemini" value="Google Gemini API&#10;ChatGoogleGenerativeAI&#10;model: gemini-3.5-flash-lite" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="140" width="220" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- tools.py -->
+        <mxCell id="tools" value="watchagent/tools.py" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="760" y="420" width="240" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- individual tools -->
+        <mxCell id="tool1" value="list_watchlist()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="760" y="490" width="240" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="tool2" value="search_watch_price(query)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="760" y="536" width="240" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="tool3" value="record_price(watch_id, price,&#10;source_url, snippet)&#10;REJECTS if price not found in snippet" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="760" y="582" width="240" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="tool4" value="get_price_history(watch_id)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="760" y="644" width="240" height="36" as="geometry" />
+        </mxCell>
+
+        <!-- Tavily -->
+        <mxCell id="tavily" value="Tavily Search API&#10;TavilySearch" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="1080" y="536" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- config.py -->
+        <mxCell id="config" value="watchagent/config.py&#10;.env: GOOGLE_API_KEY, TAVILY_API_KEY,&#10;GEMINI_MODEL, TELEGRAM_BOT_TOKEN,&#10;TELEGRAM_CHAT_ID" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="500" y="30" width="280" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- WatchVerdict -->
+        <mxCell id="verdict" value="WatchVerdict (Pydantic)&#10;watch, current_price, target_price,&#10;trend, verdict, reasoning" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="500" y="160" width="200" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="user" target="cli">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e1r" value="verdict table / confirmation" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;endArrow=block;" edge="1" parent="1" source="cli" target="user">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e20" value="check round&#10;every N minutes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="scheduler" target="cli">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e2" value="add / list" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="cli" target="db">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="db" target="sqlite">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e4" value="check: per watch" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="cli" target="agent">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" value="structured_response" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;endArrow=block;" edge="1" parent="1" source="agent" target="cli">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="agent" target="createagent">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="createagent" target="gemini">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="createagent" target="tools">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="createagent" target="verdict">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="tools" target="tool1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="tools" target="tool2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="tools" target="tool3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="tools" target="tool4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e14" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="tool1" target="db">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="700" y="508" />
+              <mxPoint x="480" y="508" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e15" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="tool3" target="db">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="700" y="608" />
+              <mxPoint x="480" y="608" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="tool4" target="db">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="700" y="662" />
+              <mxPoint x="480" y="662" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e17" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="tool2" target="tavily">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e18" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;" edge="1" parent="1" source="config" target="agent">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e19" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;" edge="1" parent="1" source="config" target="db">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="330" y="70" />
+              <mxPoint x="330" y="120" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e24" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;" edge="1" parent="1" source="config" target="notify">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="150" y="15" />
+              <mxPoint x="150" y="805" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e21" value="if --notify and verdict==BUY&#10;and cooldown elapsed:&#10;send_telegram(text)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="cli" target="notify">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e22" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="notify" target="telegram">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e23" value="mark_alerted(watch_id)&#10;sets last_alerted_at" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;" edge="1" parent="1" source="cli" target="db">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="200" y="730" />
+              <mxPoint x="200" y="600" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Legend -->
+        <mxCell id="legend" value="Legend" style="text;html=1;fontStyle=1;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="40" y="60" width="100" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="leg1" value="Our code (watchagent/*)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="40" y="90" width="180" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="leg2" value="LangChain / Pydantic objects" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="40" y="130" width="180" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="leg3" value="Tool functions" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="40" y="170" width="180" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="leg4" value="External API" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="40" y="210" width="180" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="leg5" value="Storage" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="40" y="250" width="180" height="40" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
 </mxfile>

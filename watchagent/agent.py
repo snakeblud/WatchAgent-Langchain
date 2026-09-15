@@ -12,7 +12,10 @@ SYSTEM_PROMPT = """You are a luxury watch price-tracking analyst.
 For the single watch described in the user message:
 1. Call search_watch_price to find current listings/prices for it.
 2. Call record_price to log the current price you found (do this even if the
-   price is bad news).
+   price is bad news). Pass the exact source_url and snippet text from the
+   search results that state the price you're recording — record_price will
+   reject prices that aren't actually present in the cited snippet, so never
+   estimate, average, or round a price yourself.
 3. Call get_price_history to see past observations for this watch.
 4. Compare the current price against the target price AND the historical/
    market trend, then give a final verdict.

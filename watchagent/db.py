@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS watches (
     reference_no TEXT,
     target_price REAL NOT NULL,
     currency TEXT NOT NULL DEFAULT 'USD',
-    notes TEXT
+    notes TEXT,
+    last_alerted_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS price_history (
@@ -41,6 +42,9 @@ def get_conn():
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(watches)")}
+        if "last_alerted_at" not in columns:
+            conn.execute("ALTER TABLE watches ADD COLUMN last_alerted_at TEXT")
 
 
 def add_watch(brand: str, model: str, target_price: float, reference_no: str = "",
@@ -82,3 +86,11 @@ def get_price_history(watch_id: int, limit: int = 20) -> list[sqlite3.Row]:
             "SELECT * FROM price_history WHERE watch_id = ? ORDER BY fetched_at DESC LIMIT ?",
             (watch_id, limit),
         ).fetchall()
+
+
+def mark_alerted(watch_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE watches SET last_alerted_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), watch_id),
+        )
