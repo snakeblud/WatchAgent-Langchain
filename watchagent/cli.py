@@ -50,9 +50,11 @@ def _maybe_notify(row, verdict, cooldown_hours: float) -> None:
     db.mark_alerted(row["id"])
 
 
-def _run_checks(agent, rows, notify: bool, cooldown_hours: float) -> None:
+def _run_checks(agent, rows, notify: bool, cooldown_hours: float) -> int:
+    """Runs a check round. Returns the number of watches that failed to check."""
     from watchagent.agent import check_watch
 
+    failures = 0
     print(f"{'WATCH':30} {'CURRENT':>12} {'TARGET':>10} {'VERDICT':>11}  TREND / REASONING")
     print("-" * 110)
     for row in rows:
@@ -60,6 +62,7 @@ def _run_checks(agent, rows, notify: bool, cooldown_hours: float) -> None:
             verdict = check_watch(agent, row)
         except Exception as e:
             print(f"{row['brand']} {row['model']}: check failed: {e}", file=sys.stderr)
+            failures += 1
             continue
         print(f"{verdict.watch:30} {verdict.current_price:>8.2f} {verdict.currency:<3} "
               f"{verdict.target_price:>10.2f} {verdict.verdict:>11}  "
@@ -69,6 +72,7 @@ def _run_checks(agent, rows, notify: bool, cooldown_hours: float) -> None:
                 _maybe_notify(row, verdict, cooldown_hours)
             except Exception as e:
                 print(f"  (alert failed: {e})", file=sys.stderr)
+    return failures
 
 
 def cmd_check(args: argparse.Namespace) -> None:
@@ -81,7 +85,9 @@ def cmd_check(args: argparse.Namespace) -> None:
         return
 
     agent = build_agent()
-    _run_checks(agent, rows, notify=args.notify, cooldown_hours=args.alert_cooldown_hours)
+    failures = _run_checks(agent, rows, notify=args.notify, cooldown_hours=args.alert_cooldown_hours)
+    if failures:
+        sys.exit(1)
 
 
 def cmd_schedule(args: argparse.Namespace) -> None:
