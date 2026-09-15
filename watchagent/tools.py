@@ -1,11 +1,21 @@
 import re
+import statistics
 
 from langchain_core.tools import tool
 from langchain_tavily import TavilySearch
+from pydantic import BaseModel, Field
 
 from watchagent import db
 
 _tavily = TavilySearch(max_results=5, topic="general")
+
+_SOURCE_DOMAINS: dict[str, list[str] | None] = {
+    "chrono24": ["chrono24.com"],
+    "watchcharts": ["watchcharts.com"],
+    "general": None,
+}
+
+CONSENSUS_TOLERANCE = 0.05
 
 _NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
@@ -29,18 +39,48 @@ def _price_is_grounded(price: float, snippet: str, tolerance: float = 0.01) -> b
     return False
 
 
+class PriceObservation(BaseModel):
+    source: str = Field(description='Which source this came from: "chrono24", "watchcharts", or "general"')
+    price: float = Field(description="The price stated by this source")
+    source_url: str = Field(description="URL of the listing")
+    snippet: str = Field(description="Exact text from the search result that states this price")
+
+
+def _agreeing_cluster(observations: list[PriceObservation],
+                       tolerance: float = CONSENSUS_TOLERANCE) -> list[PriceObservation]:
+    """Largest subset of observations whose prices are mutually within tolerance."""
+    best: list[PriceObservation] = []
+    for anchor in observations:
+        cluster = [o for o in observations
+                   if abs(o.price - anchor.price) / anchor.price <= tolerance]
+        if len(cluster) > len(best):
+            best = cluster
+    return best
+
+
 @tool
-def search_watch_price(query: str) -> str:
+def search_watch_price(query: str, source: str = "general") -> str:
     """Search the web for current luxury watch listings and prices.
 
     Use this to find what a specific watch (brand, model, reference number)
     is currently selling for on marketplaces, dealer sites, or price-tracking
     sites like Chrono24 or WatchCharts.
 
+    Call this at least twice with different `source` values (e.g. "chrono24"
+    then "watchcharts") to gather independent listings before recording a
+    price with record_price_confirmed — a single source is not enough to
+    confirm a price.
+
     Args:
-        query: Search query, e.g. "Rolex Submariner 126610LN price Chrono24"
+        query: Search query, e.g. "Rolex Submariner 126610LN price"
+        source: Which source to search: "chrono24", "watchcharts", or
+            "general" (broad web search across dealers/marketplaces)
     """
-    results = _tavily.invoke({"query": query})
+    domains = _SOURCE_DOMAINS.get(source, None)
+    params = {"query": query}
+    if domains:
+        params["include_domains"] = domains
+    results = _tavily.invoke(params)
     items = results.get("results", []) if isinstance(results, dict) else []
     lines = []
     for item in items:
@@ -50,7 +90,7 @@ def search_watch_price(query: str) -> str:
         url = item.get("url", "")
         content = item.get("content", "")
         lines.append(f"- {title} ({url}): {content}")
-    return "\n".join(lines) if lines else "No results found."
+    return "\n".join(lines) if lines else f"No results found for source={source}."
 
 
 @tool
@@ -93,6 +133,62 @@ def record_price(watch_id: int, price: float, currency: str, source_url: str,
 
 
 @tool
+def record_price_confirmed(watch_id: int, currency: str,
+                            observations: list[PriceObservation]) -> str:
+    """Record a price that's been cross-checked against 2+ independent sources.
+
+    Provide one PriceObservation per source you searched with different
+    `source` values in search_watch_price (e.g. one from "chrono24", one from
+    "watchcharts"). This is rejected unless:
+      - each observation's price actually appears in its own snippet, AND
+      - at least 2 observations from different sources agree within 5% of
+        each other.
+
+    On success, records the median of the agreeing observations. If your
+    sources disagree, or you only have one usable source, this tool returns
+    an error — fall back to record_price with your single best grounded
+    source instead, and note the lower confidence in your final reasoning.
+
+    Args:
+        watch_id: The id of the watch (from list_watchlist)
+        currency: Currency code, e.g. "USD"
+        observations: One PriceObservation per source (need 2+ distinct sources)
+    """
+    if len(observations) < 2:
+        return "ERROR: need observations from at least 2 different sources to confirm a price."
+
+    ungrounded = [o for o in observations if not _price_is_grounded(o.price, o.snippet)]
+    if ungrounded:
+        bad = ", ".join(f"{o.source} ({o.price})" for o in ungrounded)
+        return f"ERROR: price not found in the cited snippet for: {bad}. Not recorded."
+
+    distinct_sources = {o.source for o in observations}
+    if len(distinct_sources) < 2:
+        return (f"ERROR: observations must come from at least 2 different sources "
+                f"(got only: {', '.join(distinct_sources)}).")
+
+    cluster = _agreeing_cluster(observations)
+    cluster_sources = {o.source for o in cluster}
+    if len(cluster) < 2 or len(cluster_sources) < 2:
+        summary = ", ".join(f"{o.source}={o.price}" for o in observations)
+        return (
+            f"ERROR: sources do not agree closely enough to confirm ({summary}). "
+            "Not recorded. Use record_price with your best single grounded "
+            "source instead, and mention the low confidence in your reasoning."
+        )
+
+    confirmed_price = statistics.median(o.price for o in cluster)
+    citation = "; ".join(f"{o.source}: {o.price} ({o.source_url})" for o in cluster)
+    db.record_price(
+        watch_id, confirmed_price, currency,
+        source_url=cluster[0].source_url,
+        snippet=f"Confirmed across {len(cluster)} sources - {citation}",
+    )
+    return (f"Recorded confirmed price {confirmed_price} {currency} for watch {watch_id} "
+            f"(agreement across {len(cluster)} sources: {cluster_sources}).")
+
+
+@tool
 def get_price_history(watch_id: int) -> str:
     """Get past recorded prices for a watch, most recent first.
 
@@ -127,4 +223,4 @@ def list_watchlist() -> str:
     )
 
 
-ALL_TOOLS = [search_watch_price, record_price, get_price_history, list_watchlist]
+ALL_TOOLS = [search_watch_price, record_price, record_price_confirmed, get_price_history, list_watchlist]
