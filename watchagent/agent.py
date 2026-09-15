@@ -28,8 +28,9 @@ For the single watch described in the user message:
    price for you. If it's rejected (sources disagree, or you only found one
    usable source), instead call record_price with your single best grounded
    source. Whichever path you used, START your final reasoning with either
-   "CONFIRMED (N sources): " or "SINGLE-SOURCE (lower confidence): " so the
-   confidence level is always explicit.
+   "CONFIRMED (<source names, e.g. chrono24 + watchcharts>): " or
+   "SINGLE-SOURCE (<source name>, lower confidence): " so the confidence
+   level AND which source(s) it came from are always explicit.
 4. Call get_price_history to see past observations for this watch.
 5. Compare the current price against the target price AND the historical/
    market trend, then give a final verdict.

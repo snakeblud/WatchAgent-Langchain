@@ -178,14 +178,16 @@ def record_price_confirmed(watch_id: int, currency: str,
         )
 
     confirmed_price = statistics.median(o.price for o in cluster)
+    source_names = " + ".join(sorted(cluster_sources))
     citation = "; ".join(f"{o.source}: {o.price} ({o.source_url})" for o in cluster)
     db.record_price(
         watch_id, confirmed_price, currency,
         source_url=cluster[0].source_url,
-        snippet=f"Confirmed across {len(cluster)} sources - {citation}",
+        snippet=f"Confirmed across {source_names} - {citation}",
     )
     return (f"Recorded confirmed price {confirmed_price} {currency} for watch {watch_id} "
-            f"(agreement across {len(cluster)} sources: {cluster_sources}).")
+            f"(agreement across sources: {source_names}). In your final reasoning, "
+            f"prefix with \"CONFIRMED ({source_names}): \".")
 
 
 @tool
