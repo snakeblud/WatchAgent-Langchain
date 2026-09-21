@@ -4,19 +4,27 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from watchagent import db
+from watchagent.verdict import describe_trend
 
-DEFAULT_ALERT_COOLDOWN_HOURS = 12.0
+DEFAULT_ALERT_COOLDOWN_HOURS = 48.0
+# A BUY inside the cooldown still alerts if the price is this much lower than
+# at the last alert.
+ALERT_IMPROVEMENT_PCT = 3.0
 
 
 def cmd_add(args: argparse.Namespace) -> None:
-    watch_id = db.add_watch(
-        brand=args.brand,
-        model=args.model,
-        target_price=args.target_price,
-        reference_no=args.ref or "",
-        currency=args.currency,
-        notes=args.notes or "",
-    )
+    try:
+        watch_id = db.add_watch(
+            brand=args.brand,
+            model=args.model,
+            target_price=args.target_price,
+            reference_no=args.ref or "",
+            currency=args.currency,
+            notes=args.notes or "",
+        )
+    except ValueError as e:
+        print(f"Not added: {e}", file=sys.stderr)
+        sys.exit(1)
     print(f"Added watch id={watch_id}: {args.brand} {args.model} (target {args.target_price} {args.currency})")
 
 
@@ -30,24 +38,27 @@ def cmd_list(_args: argparse.Namespace) -> None:
               f"- target {r['target_price']} {r['currency']}")
 
 
-def _maybe_notify(row, verdict, cooldown_hours: float) -> None:
+def should_alert(row, result, cooldown_hours: float, now: datetime | None = None) -> bool:
+    """Alert on a BUY that hasn't been alerted recently, or has got clearly cheaper since."""
+    if result.verdict.verdict != "BUY":
+        return False
+    last = row["last_alerted_at"]
+    if not last:
+        return True
+    now = now or datetime.now(timezone.utc)
+    if now - datetime.fromisoformat(last) >= timedelta(hours=cooldown_hours):
+        return True
+    last_price = row["last_alerted_price"]
+    return last_price is not None and result.price <= last_price * (1 - ALERT_IMPROVEMENT_PCT / 100)
+
+
+def _maybe_notify(row, result, cooldown_hours: float) -> None:
     from watchagent.notify import send_telegram
 
-    if verdict.verdict != "BUY":
+    if not should_alert(row, result, cooldown_hours):
         return
-    last = row["last_alerted_at"]
-    if last:
-        last_dt = datetime.fromisoformat(last)
-        if datetime.now(timezone.utc) - last_dt < timedelta(hours=cooldown_hours):
-            return
-    send_telegram(
-        f"BUY: {verdict.watch}\n"
-        f"Current: {verdict.current_price:.2f} {verdict.currency} "
-        f"(target {verdict.target_price:.2f})\n"
-        f"Trend: {verdict.trend}\n"
-        f"{verdict.reasoning}"
-    )
-    db.mark_alerted(row["id"])
+    send_telegram(result.message())
+    db.mark_alerted(row["id"], result.price)
 
 
 def _run_checks(agent, rows, notify: bool, cooldown_hours: float) -> int:
@@ -59,17 +70,18 @@ def _run_checks(agent, rows, notify: bool, cooldown_hours: float) -> int:
     print("-" * 110)
     for row in rows:
         try:
-            verdict = check_watch(agent, row)
+            result = check_watch(agent, row)
         except Exception as e:
             print(f"{row['brand']} {row['model']}: check failed: {e}", file=sys.stderr)
             failures += 1
             continue
-        print(f"{verdict.watch:30} {verdict.current_price:>8.2f} {verdict.currency:<3} "
-              f"{verdict.target_price:>10.2f} {verdict.verdict:>11}  "
-              f"{verdict.trend} - {verdict.reasoning}")
+        print(f"{result.watch:30} {result.price:>8.2f} {result.currency:<3} "
+              f"{result.target_price:>10.2f} {result.verdict.verdict:>11}  "
+              f"{describe_trend(result.verdict.trend_pct)} - "
+              f"{result.confidence_label}: {result.explanation}")
         if notify:
             try:
-                _maybe_notify(row, verdict, cooldown_hours)
+                _maybe_notify(row, result, cooldown_hours)
             except Exception as e:
                 print(f"  (alert failed: {e})", file=sys.stderr)
     return failures
@@ -80,6 +92,11 @@ def cmd_check(args: argparse.Namespace) -> None:
     from watchagent.agent import build_agent
 
     rows = db.list_watches()
+    if args.id is not None:
+        rows = [r for r in rows if r["id"] == args.id]
+        if not rows:
+            print(f"No watch with id {args.id}. See `watchagent list`.", file=sys.stderr)
+            sys.exit(1)
     if not rows:
         print("Watchlist is empty. Add a watch first with: watchagent add ...")
         return
@@ -131,7 +148,24 @@ def cmd_telegram_test(_args: argparse.Namespace) -> None:
     print("Sent a test message to your configured Telegram chat.")
 
 
-def main() -> None:
+def cmd_bot(_args: argparse.Namespace) -> None:
+    from watchagent.bot import run_once
+
+    handled = run_once()
+    print(f"Handled {handled} Telegram update(s).")
+
+
+def _add_alert_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--notify", action="store_true",
+                        help="Send a Telegram alert for a BUY verdict")
+    parser.add_argument("--alert-cooldown-hours", type=float,
+                        default=DEFAULT_ALERT_COOLDOWN_HOURS,
+                        help="Don't re-alert the same watch within this many hours unless the "
+                             f"price drops another {ALERT_IMPROVEMENT_PCT:g}%% "
+                             f"(default {DEFAULT_ALERT_COOLDOWN_HOURS:g})")
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="watchagent", description="Luxury watch price tracker & buy advisor")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -148,23 +182,14 @@ def main() -> None:
     p_list.set_defaults(func=cmd_list)
 
     p_check = sub.add_parser("check", help="Check current prices and get buy advice")
-    p_check.add_argument("--notify", action="store_true",
-                          help="Send a Telegram alert for any BUY verdict")
-    p_check.add_argument("--alert-cooldown-hours", type=float,
-                          default=DEFAULT_ALERT_COOLDOWN_HOURS,
-                          help="Don't re-alert the same watch within this many hours "
-                               f"(default {DEFAULT_ALERT_COOLDOWN_HOURS})")
+    p_check.add_argument("--id", type=int, help="Only check the watch with this id")
+    _add_alert_args(p_check)
     p_check.set_defaults(func=cmd_check)
 
     p_schedule = sub.add_parser("schedule", help="Run checks repeatedly on an interval")
     p_schedule.add_argument("--interval-minutes", type=float, default=60.0,
                              help="Minutes between check rounds (default 60)")
-    p_schedule.add_argument("--notify", action="store_true",
-                             help="Send a Telegram alert for any BUY verdict")
-    p_schedule.add_argument("--alert-cooldown-hours", type=float,
-                             default=DEFAULT_ALERT_COOLDOWN_HOURS,
-                             help="Don't re-alert the same watch within this many hours "
-                                  f"(default {DEFAULT_ALERT_COOLDOWN_HOURS})")
+    _add_alert_args(p_schedule)
     p_schedule.set_defaults(func=cmd_schedule)
 
     p_tg_setup = sub.add_parser("telegram-setup",
@@ -174,7 +199,13 @@ def main() -> None:
     p_tg_test = sub.add_parser("telegram-test", help="Send a test Telegram alert")
     p_tg_test.set_defaults(func=cmd_telegram_test)
 
-    args = parser.parse_args()
+    p_bot = sub.add_parser("bot", help="Answer pending Telegram messages once, then exit")
+    p_bot.set_defaults(func=cmd_bot)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     db.init_db()
     args.func(args)
 

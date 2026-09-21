@@ -8,13 +8,16 @@ on:
 permissions:
   contents: write
 
+# Every workflow that writes watches.db shares this group so runs queue instead
+# of racing on the binary file.
 concurrency:
-  group: watchagent-check
+  group: watchagent-db
   cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,10 +36,14 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: uv run watchagent check --notify
 
+      # Runs even if some watches failed above: the ones that succeeded already
+      # wrote their prices and alert state, and dropping them would re-alert.
       - name: Commit updated price history
+        if: ${{ !cancelled() }}
         run: |
           git config user.name "watchagent-bot"
           git config user.email "actions@users.noreply.github.com"
           git add watches.db
           git diff --staged --quiet || git commit -m "Update watch price history [skip ci]"
+          git pull --rebase || { echo "::error::watches.db conflicts with a newer commit; resolve it and re-run"; exit 1; }
           git push

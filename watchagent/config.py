@@ -12,7 +12,8 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-DB_PATH = Path(__file__).resolve().parent.parent / "watches.db"
+DB_PATH = Path(os.environ.get("WATCHAGENT_DB")
+               or Path(__file__).resolve().parent.parent / "watches.db")
 
 
 def require_api_keys() -> None:

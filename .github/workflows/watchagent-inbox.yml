@@ -1,0 +1,57 @@
+name: WatchAgent Inbox
+
+# Answers pending Telegram messages (/list, /check, /add, ...) and exits.
+#
+# Polls every 5 minutes (GitHub often delays scheduled runs, so expect replies
+# in roughly 5-15 minutes). That is ~8,600 runs a month, which is only free on
+# a public repo: if this repo goes private again, disable the schedule below
+# or it will exhaust the 2,000 free minutes. Run by hand with:
+#   gh workflow run "WatchAgent Inbox"
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+# Same group as the price check: both write watches.db, so they must queue.
+concurrency:
+  group: watchagent-db
+  cancel-in-progress: false
+
+jobs:
+  inbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Answer pending Telegram messages
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: uv run watchagent bot
+
+      # An idle poll changes nothing, so this only commits when a message
+      # actually edited the watchlist, ran a check, or moved the update offset.
+      - name: Commit changes
+        if: ${{ !cancelled() }}
+        run: |
+          git config user.name "watchagent-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add watches.db
+          git diff --staged --quiet || git commit -m "Update watchlist from Telegram [skip ci]"
+          git pull --rebase || { echo "::error::watches.db conflicts with a newer commit; resolve it and re-run"; exit 1; }
+          git push
