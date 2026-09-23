@@ -5,17 +5,14 @@ import pytest
 
 from watchagent import db, tools
 from watchagent.tools import (
-    PriceObservation,
+    Listing,
     WatchContext,
-    _agreeing_cluster,
     _amounts_in_text,
     _price_is_grounded,
+    _ref_key,
+    _same_reference,
     _source_from_url,
 )
-
-
-def obs(price, url="https://www.chrono24.com/a"):
-    return PriceObservation(price=price, source_url=url, snippet="")
 
 
 # --- amounts -----------------------------------------------------------------
@@ -71,16 +68,25 @@ def test_wrong_currency_is_not_grounded():
     assert not _price_is_grounded(14_000, "EUR 14,000", "USD")
 
 
-# --- clustering and sources --------------------------------------------------
+# --- references and sources -------------------------------------------------
 
-def test_cluster_is_mutual_not_anchor_relative():
-    # 100 and 105 are within 5%; 110 is within 5% of 105 but not of 100.
-    cluster = _agreeing_cluster([obs(100), obs(105), obs(110)])
-    assert sorted(o.price for o in cluster) == [100, 105]
+@pytest.mark.parametrize("ref,key", [
+    ("5167A-001", "5167A"), ("126610LN", "126610LN"), ("200V/701", "200V"),
+    ("sbga211", "SBGA211"), ("", ""),
+])
+def test_reference_key(ref, key):
+    assert _ref_key(ref) == key
 
 
-def test_cluster_never_divides_by_zero():
-    assert _agreeing_cluster([obs(0), obs(100)]) is not None
+@pytest.mark.parametrize("seen,wanted,same", [
+    ("126610", "126610LN", True),       # listing omits the suffix
+    ("126610LN-0001", "126610LN", True),
+    ("5167A-001", "5167A", True),
+    ("126610LV", "126610LN", False),    # Starbucks, a different watch
+    ("5968A", "5167A", False),
+])
+def test_same_reference(seen, wanted, same):
+    assert _same_reference(seen, wanted) is same
 
 
 @pytest.mark.parametrize("url,source", [
@@ -94,12 +100,25 @@ def test_source_comes_from_the_url_domain(url, source):
     assert _source_from_url(url) == source
 
 
-# --- record tools ------------------------------------------------------------
+# --- submit_listings ---------------------------------------------------------
 
-CHRONO_URL = "https://www.chrono24.com/rolex/sub.htm"
-CHARTS_URL = "https://watchcharts.com/watch_model/126610ln"
-CHRONO_LINE = f"- Rolex Submariner ({CHRONO_URL}): Pre-owned $15,200 incl. box and papers"
-CHARTS_LINE = f"- Rolex Submariner 126610LN ({CHARTS_URL}): Market price $15,600"
+URLS = [f"https://www.chrono24.com/rolex/sub-{i}.htm" for i in range(5)]
+DEALER = "https://www.bobswatches.com/rolex-submariner-126610ln"
+CHARTS = "https://watchcharts.com/watch_model/126610"
+RESULTS = {
+    URLS[0]: f"- Rolex Submariner 126610LN ({URLS[0]}): Pre-owned $15,200 box and papers",
+    URLS[1]: f"- Rolex Submariner 126610LN ({URLS[1]}): Unworn $15,600",
+    URLS[2]: f"- Rolex Submariner Date 126610LN ({URLS[2]}): $14,900",
+    URLS[3]: f"- Rolex Submariner 126610LV Starbucks ({URLS[3]}): $17,500",
+    URLS[4]: f"- Rolex Submariner 126610LN ({URLS[4]}): Parts watch $4,000",
+    DEALER: f"- Submariner 126610LN at Bob's ({DEALER}): $15,450",
+    CHARTS: f"- Submariner Date 126610LN ({CHARTS}): Market Price $13,706",
+}
+
+
+def listing(url, price, snippet=None, ref="126610LN", kind="asking"):
+    return Listing(price=price, source_url=url, snippet=snippet or f"${price:,.0f}",
+                   reference_seen=ref, kind=kind)
 
 
 @pytest.fixture
@@ -107,92 +126,99 @@ def ctx(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", Path(tmp_path / "test.db"))
     db.init_db()
     watch_id = db.add_watch("Rolex", "Submariner", 15_000, "126610LN")
-    return WatchContext(
-        watch_id=watch_id, currency="USD", run_id="run1",
-        search_results={CHRONO_URL: CHRONO_LINE, CHARTS_URL: CHARTS_LINE},
-    )
+    return WatchContext(watch_id=watch_id, currency="USD", run_id="run1",
+                        reference_no="126610LN", search_results=dict(RESULTS))
 
 
-def call(tool, ctx, **kwargs):
-    return tool.func(runtime=SimpleNamespace(context=ctx), **kwargs)
+def submit(ctx, *listings):
+    return tools.submit_listings.func(listings=list(listings), runtime=SimpleNamespace(context=ctx))
 
 
-def rows(watch_id):
-    return db.get_price_history(watch_id)
+def test_three_good_listings_record_their_median(ctx):
+    out = submit(ctx, listing(URLS[0], 15200), listing(URLS[1], 15600), listing(DEALER, 15450))
+    assert "Recorded 15,450 USD" in out
+    assert ctx.recorded.listings == 3 and ctx.recorded.sources == ["bobswatches.com", "chrono24"]
+    (row,) = db.get_price_history(ctx.watch_id)
+    assert (row["price"], row["run_id"]) == (15450, "run1")
 
 
-def test_record_price_accepts_a_real_listing(ctx):
-    out = call(tools.record_price, ctx, price=15200, source_url=CHRONO_URL,
-               snippet="Pre-owned $15,200 incl. box")
-    assert out.startswith("Recorded")
-    assert ctx.recorded.confidence == "SINGLE-SOURCE" and ctx.recorded.sources == ["chrono24"]
-    (row,) = rows(ctx.watch_id)
-    assert (row["run_id"], row["source"], row["price"]) == ("run1", "chrono24", 15200)
+def test_listings_add_up_across_calls_and_feedback_says_what_is_missing(ctx):
+    out = submit(ctx, listing(URLS[0], 15200))
+    assert "Accepted 1" in out and "Need 2 more" in out and ctx.recorded is None
+    out = submit(ctx, listing(URLS[1], 15600), listing(URLS[0], 15200))
+    assert "already submitted" in out and "Need 1 more" in out
+    assert "Recorded" in submit(ctx, listing(URLS[2], 14900))
 
 
-def test_record_price_rejects_a_url_search_never_returned(ctx):
-    out = call(tools.record_price, ctx, price=15200, source_url="https://evil.example/x",
-               snippet="$15,200")
-    assert out.startswith("ERROR") and "not in the search" in out
-    assert rows(ctx.watch_id) == [] and ctx.recorded is None
+def test_wrong_reference_is_rejected_with_the_reason(ctx):
+    out = submit(ctx, listing(URLS[3], 17500, ref="126610LV"))
+    assert "reference 126610LV is not 126610LN" in out and ctx.accepted == []
 
 
-def test_record_price_rejects_an_invented_snippet(ctx):
-    out = call(tools.record_price, ctx, price=9000, source_url=CHRONO_URL,
-               snippet="Brand new $9,000 with warranty")
-    assert out.startswith("ERROR") and "not text from that search result" in out
-    assert rows(ctx.watch_id) == []
+def test_reference_must_appear_on_the_page_even_if_the_model_claims_it(ctx):
+    ctx.search_results[URLS[3]] = f"- Rolex Submariner Starbucks ({URLS[3]}): $17,500"
+    out = submit(ctx, listing(URLS[3], 17500, ref="126610LN"))
+    assert "does not appear" in out and ctx.accepted == []
 
 
-def test_record_price_rejects_a_price_not_in_the_snippet(ctx):
-    out = call(tools.record_price, ctx, price=14000, source_url=CHRONO_URL,
-               snippet="Pre-owned $15,200 incl. box")
-    assert out.startswith("ERROR") and "not stated" in out
+def test_invented_url_snippet_or_price_is_rejected(ctx):
+    out = submit(ctx,
+                 listing("https://evil.example/x", 15200),
+                 listing(URLS[0], 9000, snippet="Brand new $9,000"),
+                 listing(URLS[1], 14000, snippet="Unworn $15,600"))
+    assert "not in the search_watch_price results" in out
+    assert "not text from that search result" in out
+    assert "not stated as a USD amount" in out
+    assert ctx.accepted == []
 
 
-def test_only_one_price_is_recorded_per_check(ctx):
-    call(tools.record_price, ctx, price=15200, source_url=CHRONO_URL, snippet="$15,200")
-    out = call(tools.record_price, ctx, price=15600, source_url=CHARTS_URL, snippet="$15,600")
-    assert out.startswith("ERROR: a price was already recorded")
-    assert len(rows(ctx.watch_id)) == 1
+def test_estimates_do_not_count_as_listings(ctx):
+    out = submit(ctx, listing(CHARTS, 13706, snippet="Market Price $13,706", ref="126610", kind="estimate"))
+    assert "market estimates don't count" in out and ctx.accepted == []
 
 
-def test_confirmed_records_the_median_of_agreeing_sites(ctx):
-    out = call(tools.record_price_confirmed, ctx, observations=[
-        PriceObservation(price=15200, source_url=CHRONO_URL, snippet="Pre-owned $15,200"),
-        PriceObservation(price=15600, source_url=CHARTS_URL, snippet="Market price $15,600"),
-    ])
-    assert out.startswith("Recorded 15400")
-    assert ctx.recorded.confidence == "CONFIRMED"
-    assert ctx.recorded.sources == ["chrono24", "watchcharts"]
-    (row,) = rows(ctx.watch_id)
-    assert row["source"] == "chrono24 + watchcharts" and row["price"] == 15400
+def test_outlier_is_dropped_before_the_median(ctx):
+    out = submit(ctx, listing(URLS[0], 15200), listing(URLS[1], 15600),
+                 listing(URLS[2], 14900), listing(URLS[4], 4000))
+    assert "more than 25% from the other listings" in out
+    assert ctx.recorded.listings == 3 and ctx.recorded.price == 15200
 
 
-def test_confirmed_rejects_sites_that_disagree(ctx):
-    ctx.search_results[CHARTS_URL] = f"- Rolex ({CHARTS_URL}): Market price $19,000"
-    out = call(tools.record_price_confirmed, ctx, observations=[
-        PriceObservation(price=15200, source_url=CHRONO_URL, snippet="$15,200"),
-        PriceObservation(price=19000, source_url=CHARTS_URL, snippet="$19,000"),
-    ])
-    assert out.startswith("ERROR") and "do not agree" in out
-    assert rows(ctx.watch_id) == [] and ctx.recorded is None
+def test_nothing_is_recorded_twice(ctx):
+    submit(ctx, listing(URLS[0], 15200), listing(URLS[1], 15600), listing(DEALER, 15450))
+    assert "already recorded" in submit(ctx, listing(URLS[2], 14900))
+    assert len(db.get_price_history(ctx.watch_id)) == 1
 
 
-def test_confirmed_needs_two_different_sites(ctx):
-    other = "https://www.chrono24.com/rolex/other.htm"
-    ctx.search_results[other] = f"- Rolex ({other}): $15,300"
-    out = call(tools.record_price_confirmed, ctx, observations=[
-        PriceObservation(price=15200, source_url=CHRONO_URL, snippet="$15,200"),
-        PriceObservation(price=15300, source_url=other, snippet="$15,300"),
-    ])
-    assert out.startswith("ERROR") and "2 different sites" in out
+def test_finalize_records_fewer_listings_as_lower_confidence(ctx):
+    submit(ctx, listing(URLS[0], 15200), listing(URLS[1], 15600))
+    recorded = tools.finalize(ctx)
+    assert recorded.listings == 2 and recorded.price == 15400
 
 
-def test_confirmed_rejects_one_bad_observation_and_names_it(ctx):
-    out = call(tools.record_price_confirmed, ctx, observations=[
-        PriceObservation(price=15200, source_url=CHRONO_URL, snippet="$15,200"),
-        PriceObservation(price=15600, source_url="https://nope.example/x", snippet="$15,600"),
-    ])
-    assert out.startswith("ERROR") and "nope.example" in out
-    assert rows(ctx.watch_id) == []
+def test_finalize_with_nothing_accepted_records_nothing(ctx):
+    assert tools.finalize(ctx) is None and db.get_price_history(ctx.watch_id) == []
+
+
+def test_open_listing_only_opens_search_results(ctx, monkeypatch):
+    runtime = SimpleNamespace(context=ctx)
+    assert tools.open_listing.func(url="https://evil.example/x", runtime=runtime).startswith("ERROR")
+    page = "Rolex Submariner 126610LN\nListing A $15,300\nShipping info\nListing B $15,350"
+    fake = SimpleNamespace(invoke=lambda _: {"results": [{"raw_content": page}]})
+    monkeypatch.setattr(tools, "_extractor", lambda: fake)
+    out = tools.open_listing.func(url=URLS[0], runtime=runtime)
+    assert out == "Listing A $15,300\nListing B $15,350"
+    # Prices read from the opened page can now be submitted.
+    assert "Accepted 1" in submit(ctx, listing(URLS[0], 15350, snippet="Listing B $15,350"))
+
+
+def test_save_note_is_bound_to_the_watch(ctx):
+    tools.save_note.func(note="  search the full ref  ", runtime=SimpleNamespace(context=ctx))
+    assert db.recent_notes(ctx.watch_id) == ["search the full ref"]
+
+
+def test_several_listings_on_one_page_count_separately(ctx):
+    page = URLS[0]
+    ctx.search_results[page] += " also $15,300 and $15,450"
+    out = submit(ctx, listing(page, 15200), listing(page, 15300), listing(page, 15450))
+    assert "Recorded 15,300 USD" in out

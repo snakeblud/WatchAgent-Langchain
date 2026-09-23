@@ -1,29 +1,38 @@
+"""The research agent's tools, and the deterministic checks behind them.
+
+The model searches, opens pages and submits listings; code then decides which
+listings to trust. A listing counts only if its price is written in real search
+text (grounding), it is for the right reference, and it is not an outlier. Once
+MIN_LISTINGS agree, their median is recorded as the watch's price, once per check.
+"""
 import re
 import statistics
 from dataclasses import dataclass, field
 from functools import lru_cache
+from typing import Literal
 from urllib.parse import urlparse
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
-from langchain_tavily import TavilySearch
+from langchain_tavily import TavilyExtract, TavilySearch
 from pydantic import BaseModel, Field
 
 from watchagent import db
 
-@lru_cache(maxsize=1)
-def _tavily() -> TavilySearch:
-    # Built on first use so importing this module doesn't need TAVILY_API_KEY.
-    return TavilySearch(max_results=5, topic="general")
+# A check records a price once this many listings of the right reference agree.
+MIN_LISTINGS = 3
+# Accepted listings further than this from their median are treated as outliers.
+OUTLIER_PCT = 25.0
+# A submitted price must be within this fraction of an amount written in its snippet.
+GROUNDING_TOLERANCE = 0.01
+# How many price lines of an opened page the model gets to see.
+MAX_PAGE_LINES = 60
 
 _SOURCE_DOMAINS: dict[str, list[str] | None] = {
     "chrono24": ["chrono24.com"],
     "watchcharts": ["watchcharts.com"],
     "general": None,
 }
-
-CONSENSUS_TOLERANCE = 0.05
-GROUNDING_TOLERANCE = 0.01
 
 # How a currency is written next to an amount. Anything not listed is matched
 # by its ISO code alone.
@@ -37,21 +46,43 @@ _CURRENCY_MARKERS: dict[str, list[str]] = {
     "JPY": ["JPY", "¥"],
 }
 
+# No-break and narrow no-break space: thousands separators in e.g. "14 500 €".
 _SPACES = "  "
+# "15,200", "14.500,00", "14 500" or a plain "15200" / "99.5".
 _NUMBER = rf"\d{{1,3}}(?:[,.{_SPACES}]\d{{3}})+(?:[.,]\d{{1,2}})?|\d+(?:[.,]\d{{1,2}})?"
 
-_ALREADY_RECORDED = (
-    "ERROR: a price was already recorded for this check. Only one price is recorded "
-    "per check, so stop calling record tools and give your short explanation."
-)
 
+# --- search clients -----------------------------------------------------------
+# Built on first use so importing this module doesn't need TAVILY_API_KEY.
+
+@lru_cache(maxsize=1)
+def _tavily() -> TavilySearch:
+    return TavilySearch(max_results=5, topic="general")
+
+
+@lru_cache(maxsize=1)
+def _extractor() -> TavilyExtract:
+    return TavilyExtract()
+
+
+# --- data ---------------------------------------------------------------------
 
 @dataclass
 class RecordedPrice:
     price: float
     currency: str
-    confidence: str  # "CONFIRMED" or "SINGLE-SOURCE"
+    listings: int
     sources: list[str]
+
+
+class Listing(BaseModel):
+    price: float = Field(description="The price this listing states")
+    source_url: str = Field(description="URL of the listing, exactly as returned by search_watch_price")
+    snippet: str = Field(description="Exact text from that search result or opened page that states this price")
+    reference_seen: str = Field(description='Reference number the listing is for, as written on it, e.g. "5167A-001"; "" if not shown')
+    kind: Literal["asking", "estimate"] = Field(
+        description='"asking" for a watch for sale, "estimate" for a market-price estimate such as WatchCharts'
+    )
 
 
 @dataclass
@@ -60,18 +91,19 @@ class WatchContext:
     watch_id: int
     currency: str
     run_id: str
-    search_results: dict[str, str] = field(default_factory=dict)  # url -> result line shown to the model
+    reference_no: str = ""
+    # url -> every text the model was shown for it (search result, then any opened page)
+    search_results: dict[str, str] = field(default_factory=dict)
+    accepted: list[Listing] = field(default_factory=list)
     recorded: RecordedPrice | None = None
 
 
-class PriceObservation(BaseModel):
-    price: float = Field(description="The price stated by this listing")
-    source_url: str = Field(description="URL of the listing, exactly as returned by search_watch_price")
-    snippet: str = Field(description="Exact text from that search result that states this price")
-
+# --- reading prices out of text -----------------------------------------------
 
 def _marker_alternatives(markers: list[str]) -> str:
+    """A regex alternation of currency markers that won't match inside a word ("CHF" in "XCHFY")."""
     parts = []
+    # Longest first, so "US$" wins over "$".
     for marker in sorted(markers, key=len, reverse=True):
         tail = r"(?![A-Za-z])" if marker[-1].isalpha() else ""
         parts.append(rf"(?<![A-Za-z]){re.escape(marker)}{tail}")
@@ -95,6 +127,7 @@ def _amount_patterns(currency: str) -> tuple[re.Pattern, ...]:
 
 
 def _parse_amount(raw: str) -> float:
+    """Turn "15,200", "14.500,00" or "14 500" into a float, guessing which separator is the decimal."""
     s = raw.replace(" ", "").replace(" ", "")
     has_comma, has_dot = "," in s, "." in s
     decimal = None
@@ -126,13 +159,14 @@ def _amounts_in_text(text: str, currency: str) -> list[float]:
     return amounts
 
 
-def _price_is_grounded(price: float, snippet: str, currency: str,
-                       tolerance: float = GROUNDING_TOLERANCE) -> bool:
+def _price_is_grounded(price: float, snippet: str, currency: str) -> bool:
     return any(
-        amount > 0 and abs(amount - price) / amount <= tolerance
+        amount > 0 and abs(amount - price) / amount <= GROUNDING_TOLERANCE
         for amount in _amounts_in_text(snippet, currency)
     )
 
+
+# --- checking a listing -------------------------------------------------------
 
 def _source_from_url(url: str) -> str:
     host = (urlparse(url).hostname or "").lower().removeprefix("www.")
@@ -146,52 +180,78 @@ def _normalize(text: str) -> str:
     return " ".join(text.split()).lower()
 
 
-def _agreeing_cluster(observations: list[PriceObservation],
-                      tolerance: float = CONSENSUS_TOLERANCE) -> list[PriceObservation]:
-    """Largest subset whose prices all lie within `tolerance` of the subset's lowest price."""
-    best: list[PriceObservation] = []
-    for low in observations:
-        cluster = [o for o in observations if low.price <= o.price <= low.price * (1 + tolerance)]
-        if len(cluster) > len(best):
-            best = cluster
-    return best
+def _ref_key(ref: str) -> str:
+    """A reference's identifying part, upper-case without punctuation: 5167A-001 -> 5167A, 200V/701 -> 200V."""
+    return re.sub(r"[^A-Z0-9]", "", re.split(r"[-/ ]", ref.strip().upper())[0])
 
 
-def _observation_error(ctx: WatchContext, observation: PriceObservation) -> str | None:
-    """Why this observation can't be trusted, or None if it checks out."""
-    if observation.price <= 0:
+def _same_reference(seen: str, wanted: str) -> bool:
+    """126610 or 126610LN-0001 match 126610LN; 126610LV (a different watch) does not."""
+    seen, wanted = _ref_key(seen), _ref_key(wanted)
+    return seen.startswith(wanted) or wanted.startswith(seen)
+
+
+def _listing_error(ctx: WatchContext, listing: Listing) -> str | None:
+    """Why this listing can't be trusted, or None if it checks out."""
+    if listing.price <= 0:
         return "price must be positive"
-    line = ctx.search_results.get(observation.source_url)
-    if line is None:
+    text = ctx.search_results.get(listing.source_url)
+    if text is None:
         known = ", ".join(list(ctx.search_results)[:8])
         return f"source_url was not in the search_watch_price results (copy one exactly: {known})"
-    snippet = observation.snippet
-    if not snippet.strip() or _normalize(snippet) not in _normalize(line):
-        return "snippet is not text from that search result"
-    if not _price_is_grounded(observation.price, snippet, ctx.currency):
+    if not listing.snippet.strip() or _normalize(listing.snippet) not in _normalize(text):
+        return "snippet is not text from that search result or page"
+    if not _price_is_grounded(listing.price, listing.snippet, ctx.currency):
         return f"price is not stated as a {ctx.currency} amount in the snippet"
+    wanted = _ref_key(ctx.reference_no)
+    if wanted and listing.reference_seen and not _same_reference(listing.reference_seen, wanted):
+        return f"reference {listing.reference_seen} is not {ctx.reference_no}"
+    if wanted and wanted not in re.sub(r"[^A-Z0-9]", "", text.upper()):
+        return f"reference {ctx.reference_no} does not appear in that result or page"
     return None
 
 
+def _without_outliers(listings: list[Listing]) -> tuple[list[Listing], list[Listing]]:
+    """Split into (kept, outliers). Needs 3+ listings to tell which one is odd."""
+    if len(listings) < 3:
+        return listings, []
+    median = statistics.median(l.price for l in listings)
+    kept = [l for l in listings if abs(l.price - median) / median * 100 <= OUTLIER_PCT]
+    return kept, [l for l in listings if l not in kept]
+
+
+# --- recording the price ------------------------------------------------------
+
+def finalize(ctx: WatchContext) -> RecordedPrice | None:
+    """Record the median of the accepted listings as this check's price, if there are any.
+
+    Safe to call again: a check records at most one price.
+    """
+    if ctx.recorded or not ctx.accepted:
+        return ctx.recorded
+    kept, _ = _without_outliers(ctx.accepted)
+    price = statistics.median(l.price for l in kept)
+    sources = sorted({_source_from_url(l.source_url) for l in kept})
+    citation = "; ".join(f"{_source_from_url(l.source_url)}: {l.price} ({l.source_url})" for l in kept)
+    db.record_price(ctx.watch_id, price, ctx.currency, source_url=kept[0].source_url,
+                    snippet=f"Median of {len(kept)} listing(s) - {citation}",
+                    run_id=ctx.run_id, source=" + ".join(sources))
+    ctx.recorded = RecordedPrice(price, ctx.currency, len(kept), sources)
+    return ctx.recorded
+
+
+# --- tools --------------------------------------------------------------------
+
 @tool
 def search_watch_price(query: str, runtime: ToolRuntime[WatchContext], source: str = "general") -> str:
-    """Search the web for current luxury watch listings and prices.
-
-    Use this to find what a specific watch (brand, model, reference number)
-    is currently selling for on marketplaces, dealer sites, or price-tracking
-    sites like Chrono24 or WatchCharts.
-
-    Call this at least twice with different `source` values (e.g. "chrono24"
-    then "watchcharts") to gather independent listings before recording a
-    price with record_price_confirmed — a single source is not enough to
-    confirm a price.
+    """Search the web for current listings and prices of a watch.
 
     Args:
         query: Search query, e.g. "Rolex Submariner 126610LN price"
-        source: Which source to search: "chrono24", "watchcharts", or
-            "general" (broad web search across dealers/marketplaces)
+        source: "chrono24", "watchcharts", or "general" (broad web search
+            across dealers and marketplaces)
     """
-    domains = _SOURCE_DOMAINS.get(source, None)
+    domains = _SOURCE_DOMAINS.get(source)
     params = {"query": query}
     if domains:
         params["include_domains"] = domains
@@ -201,95 +261,97 @@ def search_watch_price(query: str, runtime: ToolRuntime[WatchContext], source: s
     for item in items:
         if not isinstance(item, dict):
             continue
-        title = item.get("title", "")
         url = item.get("url", "")
-        content = item.get("content", "")
-        line = f"- {title} ({url}): {content}"
+        line = f"- {item.get('title', '')} ({url}): {item.get('content', '')}"
+        # Remembered so submitted listings can be checked against what was really shown.
         runtime.context.search_results[url] = line
         lines.append(line)
     return "\n".join(lines) if lines else f"No results found for source={source}."
 
 
 @tool
-def record_price(price: float, source_url: str, snippet: str,
-                 runtime: ToolRuntime[WatchContext]) -> str:
-    """Record the watch's current price from ONE listing (lower confidence).
+def open_listing(url: str, runtime: ToolRuntime[WatchContext]) -> str:
+    """Open a page from the search results to read its details and prices.
 
-    Use this only if record_price_confirmed was rejected or you found just one
-    usable listing. The call is rejected unless `source_url` is a URL returned
-    by search_watch_price, `snippet` is text from that same result, and `price`
-    is written as an amount in that snippet.
+    Use this when a search snippet doesn't show the price or reference clearly,
+    or to read a marketplace page that lists several watches. Returns the
+    page's lines that mention a price.
 
     Args:
-        price: The listing's price as a number, e.g. 15200
-        source_url: URL of the listing, exactly as returned by search_watch_price
-        snippet: Exact text from that search result that states this price
+        url: A URL exactly as returned by search_watch_price
     """
     ctx = runtime.context
-    if ctx.recorded:
-        return _ALREADY_RECORDED
-    error = _observation_error(ctx, PriceObservation(price=price, source_url=source_url, snippet=snippet))
-    if error:
-        return (f"ERROR: {error}. Nothing was recorded. Re-read the search_watch_price "
-                "results and try again with exact text from them, or search again.")
-    source = _source_from_url(source_url)
-    db.record_price(ctx.watch_id, price, ctx.currency, source_url, snippet,
-                    run_id=ctx.run_id, source=source)
-    ctx.recorded = RecordedPrice(price, ctx.currency, "SINGLE-SOURCE", [source])
-    return f"Recorded {price} {ctx.currency} from {source} (single source). Now give your explanation."
+    if url not in ctx.search_results:
+        return "ERROR: only URLs returned by search_watch_price can be opened."
+    results = _extractor().invoke({"urls": [url]}).get("results") or []
+    page = (results[0].get("raw_content") or "") if results else ""
+    if not page:
+        return "ERROR: could not read that page. Try another result."
+    ctx.search_results[url] += "\n" + page
+    price_lines = [line.strip() for line in page.splitlines() if _amounts_in_text(line, ctx.currency)]
+    if not price_lines:
+        return f"The page has no {ctx.currency} prices."
+    return "\n".join(price_lines[:MAX_PAGE_LINES])
 
 
 @tool
-def record_price_confirmed(observations: list[PriceObservation],
-                           runtime: ToolRuntime[WatchContext]) -> str:
-    """Record the watch's price once 2+ different sites agree on it (preferred).
+def submit_listings(listings: list[Listing], runtime: ToolRuntime[WatchContext]) -> str:
+    """Submit listings you found for this watch. Code checks each one and says what it still needs.
 
-    Provide one PriceObservation per listing, from different sites (e.g. one
-    from chrono24.com, one from watchcharts.com). This is rejected unless:
-      - each observation's source_url is a URL returned by search_watch_price,
-        its snippet is text from that result, and its price is written as an
-        amount in that snippet, AND
-      - at least 2 observations from different sites agree within 5%.
-
-    On success, records the median of the agreeing observations. If the sites
-    disagree, or you only have one usable listing, this returns an error: fall
-    back to record_price with your single best listing.
+    Submit every usable listing, one per watch for sale (and market-price
+    estimates marked kind="estimate"). You can call this several times: accepted
+    listings add up. Once MIN_LISTINGS asking prices of the right reference are
+    accepted, the median is recorded as the watch's price and you are done.
 
     Args:
-        observations: One PriceObservation per listing (need 2+ different sites)
+        listings: The listings, each with price, source_url, snippet,
+            reference_seen and kind
     """
     ctx = runtime.context
     if ctx.recorded:
-        return _ALREADY_RECORDED
-    if len(observations) < 2:
-        return "ERROR: need listings from at least 2 different sites to confirm a price."
+        return "The price is already recorded. Give your short explanation."
 
-    problems = [
-        f"{_source_from_url(o.source_url)} ({o.price}): {error}"
-        for o in observations if (error := _observation_error(ctx, o))
-    ]
-    if problems:
-        return "ERROR: not recorded. " + "; ".join(problems)
+    rejected = []
+    for listing in listings:
+        # A marketplace page can list several watches, so a listing is its URL *and* price.
+        known = {(l.source_url, l.price) for l in ctx.accepted}
+        if (listing.source_url, listing.price) in known:
+            rejected.append(f"{listing.source_url}: already submitted")
+        elif listing.kind == "estimate":
+            rejected.append(f"{listing.source_url}: market estimates don't count as listings")
+        elif error := _listing_error(ctx, listing):
+            rejected.append(f"{listing.source_url} ({listing.price}): {error}")
+        else:
+            ctx.accepted.append(listing)
 
-    sites = {_source_from_url(o.source_url) for o in observations}
-    if len(sites) < 2:
-        return f"ERROR: listings must come from at least 2 different sites (got only: {', '.join(sites)})."
+    kept, outliers = _without_outliers(ctx.accepted)
+    rejected += [f"{l.source_url} ({l.price}): more than {OUTLIER_PCT:g}% from the other listings"
+                 for l in outliers]
+    report = f"Accepted {len(kept)} asking-price listing(s)"
+    if kept:
+        report += f", median {statistics.median(l.price for l in kept):,.0f} {ctx.currency}"
+    if rejected:
+        report += ". Rejected: " + "; ".join(rejected)
 
-    cluster = _agreeing_cluster(observations)
-    cluster_sites = sorted({_source_from_url(o.source_url) for o in cluster})
-    if len(cluster_sites) < 2:
-        summary = ", ".join(f"{_source_from_url(o.source_url)}={o.price}" for o in observations)
-        return (f"ERROR: sites do not agree within {CONSENSUS_TOLERANCE:.0%} ({summary}). Not recorded. "
-                "Use record_price with your single best listing instead.")
-
-    price = statistics.median(o.price for o in cluster)
-    names = " + ".join(cluster_sites)
-    citation = "; ".join(f"{_source_from_url(o.source_url)}: {o.price} ({o.source_url})" for o in cluster)
-    db.record_price(ctx.watch_id, price, ctx.currency, source_url=cluster[0].source_url,
-                    snippet=f"Confirmed across {names} - {citation}",
-                    run_id=ctx.run_id, source=names)
-    ctx.recorded = RecordedPrice(price, ctx.currency, "CONFIRMED", cluster_sites)
-    return f"Recorded {price} {ctx.currency}, confirmed across {names}. Now give your explanation."
+    if len(kept) >= MIN_LISTINGS:
+        recorded = finalize(ctx)
+        return f"{report}. Recorded {recorded.price:,.0f} {ctx.currency}. Now give your short explanation."
+    return (f"{report}. Need {MIN_LISTINGS - len(kept)} more: search with a more specific query "
+            "(e.g. the full reference), try another source, or open a page that lists several watches.")
 
 
-ALL_TOOLS = [search_watch_price, record_price, record_price_confirmed]
+@tool
+def save_note(note: str, runtime: ToolRuntime[WatchContext]) -> str:
+    """Save a short tip for the next time this watch is checked.
+
+    E.g. which query found good listings, or which kind of listing is a trap
+    ("generic Aquanaut pages mix in the 5968"). Keep it to one sentence.
+
+    Args:
+        note: The tip, one sentence
+    """
+    db.add_note(runtime.context.watch_id, note.strip()[:300])
+    return "Saved."
+
+
+ALL_TOOLS = [search_watch_price, open_listing, submit_listings, save_note]

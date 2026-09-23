@@ -5,7 +5,7 @@ requires-python = ">=3.14"
 dependencies = [
     "langchain>=1.0,<2.0",
     "langchain-core>=1.0,<2.0",
-    "langchain-google-genai",
+    "langchain-google-genai>=4.4.0",
     "langchain-tavily",
     "python-dotenv",
 ]

@@ -145,9 +145,46 @@ def test_free_text_goes_to_the_read_only_answerer(rec):
     assert rec.questions == ["is the Aquanaut worth it?"] and rec.texts == ["fake answer"]
 
 
-def test_qa_agent_has_no_write_tools():
-    names = {"get_watchlist_status", "get_check_history"}
-    assert {bot.get_watchlist_status.name, bot.get_check_history.name} == names
+def assistant_call(tool, rec, **kwargs):
+    return tool.func(runtime=SimpleNamespace(context=rec.services()), **kwargs)
+
+
+def test_assistant_proposals_only_stage_a_confirmation(rec):
+    out = assistant_call(bot.propose_add_watch, rec, brand="Tudor", model="Black Bay 58",
+                         reference="79030N", target_price=3500)
+    assert out == bot._PROPOSED and len(db.list_watches()) == 2
+    assert rec.sent[-1][1][0][0] == "Confirm"
+    assistant_call(bot.propose_removal, rec, watch_id=1)
+    assistant_call(bot.propose_new_target, rec, watch_id=1, target_price=1)
+    assert db.get_watch(1)["target_price"] == 14_000  # nothing changed yet
+    send(rec, tap(f"ok:{confirm_id(rec)}"))
+    assert db.get_watch(1)["target_price"] == 1
+
+
+def test_assistant_proposal_errors_go_back_to_the_model(rec):
+    assert "No watch with id 99" in assistant_call(bot.propose_removal, rec, watch_id=99)
+    assert "must be positive" in assistant_call(bot.propose_new_target, rec, watch_id=1, target_price=-5)
+    assert "Already tracking" in assistant_call(bot.propose_add_watch, rec, brand="rolex",
+                                                model="submariner", reference="126610LN", target_price=1)
+    assert rec.sent == []
+
+
+def test_assistant_research_delegates_to_the_check(rec):
+    assert assistant_call(bot.research_price, rec, watch_id=2) == "WAIT: fake result"
+    rec.check_error = RuntimeError("no listings")
+    assert assistant_call(bot.research_price, rec, watch_id=2) == "The check failed: no listings"
+
+
+def test_assistant_has_no_tool_that_writes_directly():
+    names = {t.name for t in bot.ASSISTANT_TOOLS}
+    assert names == {"get_watchlist_status", "get_check_history", "research_price",
+                     "propose_add_watch", "propose_new_target", "propose_removal"}
+
+
+def test_chat_memory_keeps_the_latest_messages_in_order():
+    for i in range(15):
+        db.add_chat("user", f"m{i}")
+    assert [c for _, c in db.recent_chat(3)] == ["m12", "m13", "m14"]
 
 
 def test_check_runs_the_agent_and_replies(rec):
@@ -228,6 +265,8 @@ def test_remove_deletes_the_watch_and_its_data(rec):
     ("/target 1", "Usage: /target"),
     ("/target 1 0", "Usage: /target"),
     ("/target 99 100", "No watch with id 99"),
+    ("/remove", "Usage: /remove"),
+    ("/remove 99", "No watch with id 99"),
 ])
 def test_bad_input_is_rejected_without_staging_anything(rec, text, fragment):
     send(rec, message(text))

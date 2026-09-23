@@ -47,7 +47,7 @@ jobs:
       # An idle poll changes nothing, so this only commits when a message
       # actually edited the watchlist, ran a check, or moved the update offset.
       - name: Commit changes
-        if: ${{ !cancelled() }}
+        if: always()
         run: |
           git config user.name "watchagent-bot"
           git config user.email "actions@users.noreply.github.com"

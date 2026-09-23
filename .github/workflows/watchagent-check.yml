@@ -36,10 +36,10 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: uv run watchagent check --notify
 
-      # Runs even if some watches failed above: the ones that succeeded already
-      # wrote their prices and alert state, and dropping them would re-alert.
+      # Runs even if a watch failed or the job timed out: the checks that
+      # finished already wrote their prices and alert state.
       - name: Commit updated price history
-        if: ${{ !cancelled() }}
+        if: always()
         run: |
           git config user.name "watchagent-bot"
           git config user.email "actions@users.noreply.github.com"

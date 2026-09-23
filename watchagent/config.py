@@ -7,7 +7,18 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+# Gemini API model names (Google AI Studio free tier).
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.5-flash-lite")
+# Tried in order when LLM_MODEL is overloaded or failing (comma-separated). These run
+# with thinking off, which "-lite" models don't accept, so don't list those here.
+LLM_FALLBACK_MODELS = os.environ.get("LLM_FALLBACK_MODELS", "gemini-3.5-flash").split(",")
+
+# Model requests per UTC day. Scheduled checks stop at their share, so the rest
+# stays free for the Telegram bot's /check and questions. The defaults sit above
+# the ~240/day the old 4x-daily schedule used on the free tier without hitting a
+# quota; lower them if Google's free-tier limits for your models are tighter.
+DAILY_REQUEST_LIMIT = int(os.environ.get("DAILY_REQUEST_LIMIT", "300"))
+SCHEDULED_REQUEST_SHARE = int(os.environ.get("SCHEDULED_REQUEST_SHARE", "250"))
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")

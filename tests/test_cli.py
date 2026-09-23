@@ -8,8 +8,8 @@ from watchagent.cli import ALERT_IMPROVEMENT_PCT, build_parser, should_alert
 NOW = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
 
 
-def result(verdict="BUY", price=10_000.0):
-    return SimpleNamespace(verdict=SimpleNamespace(verdict=verdict), price=price)
+def result(verdict="BUY", price=10_000.0, listings=3):
+    return SimpleNamespace(verdict=SimpleNamespace(verdict=verdict), price=price, listings=listings)
 
 
 def row(hours_ago=None, price=None):
@@ -62,3 +62,7 @@ def test_small_price_drop_inside_the_cooldown_is_suppressed():
 
 def test_alert_history_without_a_price_falls_back_to_the_cooldown():
     assert not should_alert(row(hours_ago=6, price=None), result(price=1), 48, NOW)
+
+
+def test_a_buy_backed_by_too_few_listings_does_not_alert():
+    assert not should_alert(row(), result(listings=2), 48, NOW)

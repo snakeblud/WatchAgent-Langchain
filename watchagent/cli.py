@@ -1,15 +1,20 @@
+"""Command-line interface: manage the watchlist, run price checks, and send alerts."""
 import argparse
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from watchagent import db
+from watchagent.config import SCHEDULED_REQUEST_SHARE
 from watchagent.verdict import describe_trend
 
 DEFAULT_ALERT_COOLDOWN_HOURS = 48.0
 # A BUY inside the cooldown still alerts if the price is this much lower than
 # at the last alert.
 ALERT_IMPROVEMENT_PCT = 3.0
+# Watches researched at the same time during a check round.
+PARALLEL_CHECKS = 3
 
 
 def cmd_add(args: argparse.Namespace) -> None:
@@ -39,8 +44,10 @@ def cmd_list(_args: argparse.Namespace) -> None:
 
 
 def should_alert(row, result, cooldown_hours: float, now: datetime | None = None) -> bool:
-    """Alert on a BUY that hasn't been alerted recently, or has got clearly cheaper since."""
-    if result.verdict.verdict != "BUY":
+    """Alert on a well-evidenced BUY that hasn't been alerted recently, or has got clearly cheaper since."""
+    from watchagent.tools import MIN_LISTINGS
+
+    if result.verdict.verdict != "BUY" or result.listings < MIN_LISTINGS:
         return False
     last = row["last_alerted_at"]
     if not last:
@@ -61,18 +68,41 @@ def _maybe_notify(row, result, cooldown_hours: float) -> None:
     db.mark_alerted(row["id"], result.price)
 
 
-def _run_checks(agent, rows, notify: bool, cooldown_hours: float) -> int:
-    """Runs a check round. Returns the number of watches that failed to check."""
-    from watchagent.agent import check_watch
+def stalest_first(rows) -> list:
+    """Watches never checked come first, then the ones whose last check is oldest."""
+    def last_checked(row) -> str:
+        check = db.latest_check(row["id"])
+        return check["checked_at"] if check else ""
+    return sorted(rows, key=last_checked)
 
-    failures = 0
+
+def _run_checks(agent, rows, notify: bool, cooldown_hours: float) -> int:
+    """Runs a check round. Returns the number of watches that failed to check.
+
+    Watches skipped because today's model budget ran out are not failures:
+    they are the stalest, so the next run starts with them.
+    """
+    from watchagent.agent import DailyBudgetExceeded, check_watch
+
+    def check_or_error(row):
+        try:
+            return check_watch(agent, row)
+        except Exception as e:
+            return e
+
+    # Research runs in parallel; printing and alerting stay in watchlist order.
+    with ThreadPoolExecutor(max_workers=PARALLEL_CHECKS) as pool:
+        outcomes = list(pool.map(check_or_error, rows))
+
+    failures = skipped = 0
     print(f"{'WATCH':30} {'CURRENT':>12} {'TARGET':>10} {'VERDICT':>11}  TREND / REASONING")
     print("-" * 110)
-    for row in rows:
-        try:
-            result = check_watch(agent, row)
-        except Exception as e:
-            print(f"{row['brand']} {row['model']}: check failed: {e}", file=sys.stderr)
+    for row, result in zip(rows, outcomes):
+        if isinstance(result, DailyBudgetExceeded):
+            skipped += 1
+            continue
+        if isinstance(result, Exception):
+            print(f"{row['brand']} {row['model']}: check failed: {result}", file=sys.stderr)
             failures += 1
             continue
         print(f"{result.watch:30} {result.price:>8.2f} {result.currency:<3} "
@@ -84,6 +114,8 @@ def _run_checks(agent, rows, notify: bool, cooldown_hours: float) -> int:
                 _maybe_notify(row, result, cooldown_hours)
             except Exception as e:
                 print(f"  (alert failed: {e})", file=sys.stderr)
+    if skipped:
+        print(f"{skipped} watch(es) skipped: today's model request budget is used up.")
     return failures
 
 
@@ -101,7 +133,10 @@ def cmd_check(args: argparse.Namespace) -> None:
         print("Watchlist is empty. Add a watch first with: watchagent add ...")
         return
 
-    agent = build_agent()
+    # A full scheduled round only gets its share of the day's model requests,
+    # so the Telegram bot keeps the rest; a one-off `check --id` may use it all.
+    agent = build_agent() if args.id is not None else build_agent(daily_limit=SCHEDULED_REQUEST_SHARE)
+    rows = stalest_first(rows)
     failures = _run_checks(agent, rows, notify=args.notify, cooldown_hours=args.alert_cooldown_hours)
     if failures:
         sys.exit(1)
@@ -110,7 +145,7 @@ def cmd_check(args: argparse.Namespace) -> None:
 def cmd_schedule(args: argparse.Namespace) -> None:
     from watchagent.agent import build_agent
 
-    agent = build_agent()
+    agent = build_agent(daily_limit=SCHEDULED_REQUEST_SHARE)
     interval_seconds = args.interval_minutes * 60
     print(f"Checking every {args.interval_minutes} minute(s)"
           f"{' with Telegram alerts on BUY' if args.notify else ''}. Ctrl+C to stop.")
@@ -120,7 +155,7 @@ def cmd_schedule(args: argparse.Namespace) -> None:
             if not rows:
                 print("Watchlist is empty. Add a watch first with: watchagent add ...")
             else:
-                _run_checks(agent, rows, notify=args.notify,
+                _run_checks(agent, stalest_first(rows), notify=args.notify,
                             cooldown_hours=args.alert_cooldown_hours)
             time.sleep(interval_seconds)
     except KeyboardInterrupt:

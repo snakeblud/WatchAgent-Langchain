@@ -7,17 +7,21 @@ TELEGRAM_CHAT_ID is ever served.
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Callable
 
+from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
 from watchagent import db
-from watchagent.config import GEMINI_MODEL, TELEGRAM_CHAT_ID, require_telegram_config
+from watchagent.config import LLM_MODEL, TELEGRAM_CHAT_ID, require_api_keys, require_telegram_config
 from watchagent.verdict import describe_trend
 
 OFFSET_KEY = "telegram_offset"
 PENDING_TTL = timedelta(hours=24)
 HISTORY_LIMIT = 10
+# Past Telegram messages (user + assistant) the assistant sees.
+CHAT_MEMORY = 12
 
 HELP = """WatchAgent commands:
 /list - watches with their latest verdict
@@ -27,14 +31,16 @@ HELP = """WatchAgent commands:
 /add brand | model | ref | target [| currency]
 /target <id> <price> - change a target price
 /remove <id> - stop tracking a watch
-Or just ask a question, e.g. "is the Aquanaut worth it yet?"
+Or just write, e.g. "add the Black Bay 58 at 3.5k and check its price".
 Adding, retargeting and removing ask you to confirm first."""
 
-QA_PROMPT = """You are the assistant for a personal luxury-watch price tracker.
-Answer using ONLY what the tools return, quoting the numbers. You cannot change
-the watchlist: if asked to add, remove or retarget a watch, tell the user to use
-/add, /target or /remove. Keep answers to a few sentences. If there is no data
-yet, say so."""
+ASSISTANT_PROMPT = """You are the assistant for a personal luxury-watch price tracker,
+chatting on Telegram. Use your tools; don't guess numbers.
+- To answer questions, read the watchlist and check history, and quote the numbers.
+- For a fresh price, use research_price (it takes about a minute).
+- To add, retarget or remove a watch, use the propose_* tools. They only send the
+  user a Confirm button; nothing changes until the user taps it, so say that.
+Keep replies to a few sentences."""
 
 
 @dataclass
@@ -46,7 +52,7 @@ class Services:
     answer: Callable[[str], str]  # free-text question -> reply
 
 
-# --- formatting ---------------------------------------------------------------
+# --- formatting and parsing ---------------------------------------------------
 
 def _label(row) -> str:
     return f"{row['brand']} {row['model']} ({row['reference_no'] or 'no ref'})"
@@ -58,9 +64,10 @@ def _check_line(check) -> str:
     return f"{check['verdict']} at {check['price']:,.0f} {check['currency']} ({check['pct_vs_target']:+.1f}% vs target)"
 
 
-def _parse_id(text: str) -> int | None:
-    text = text.strip()
-    return int(text) if text.isdigit() else None
+def _first_id(args: str) -> int | None:
+    """The watch id a command's arguments start with, e.g. 3 in "3 13500"."""
+    words = args.split()
+    return int(words[0]) if words and words[0].isdigit() else None
 
 
 def _parse_price(text: str) -> float | None:
@@ -72,7 +79,7 @@ def _parse_price(text: str) -> float | None:
 
 
 def _find_watch(args: str, services: Services):
-    watch_id = _parse_id(args.split()[0]) if args.split() else None
+    watch_id = _first_id(args)
     if watch_id is None:
         services.send("Give a watch id, e.g. /status 1 (see /list).")
         return None
@@ -82,12 +89,7 @@ def _find_watch(args: str, services: Services):
     return row
 
 
-def _confirm(services: Services, action: str, payload: dict, question: str) -> None:
-    pending_id = db.create_pending(action, payload)
-    services.send(question, [("Confirm", f"ok:{pending_id}"), ("Cancel", f"no:{pending_id}")])
-
-
-# --- commands -----------------------------------------------------------------
+# --- read-only commands -------------------------------------------------------
 
 def cmd_help(_args: str, services: Services) -> None:
     services.send(HELP)
@@ -152,6 +154,59 @@ def cmd_check(args: str, services: Services) -> None:
     services.send(result.message())
 
 
+# --- changes: staged as a pending action, run only after a Confirm tap --------
+# The slash commands and the assistant's propose_* tools both go through these.
+
+def _confirm(services: Services, action: str, payload: dict, question: str) -> None:
+    pending_id = db.create_pending(action, payload)
+    services.send(question, [("Confirm", f"ok:{pending_id}"), ("Cancel", f"no:{pending_id}")])
+
+
+def propose_add(brand: str, model: str, ref: str, target: float, currency: str,
+                services: Services) -> str | None:
+    """Ask the user to confirm adding a watch. Returns why not, or None once the button is sent."""
+    if not brand.strip() or not model.strip():
+        return "Brand and model are required."
+    if target <= 0:
+        return "The target price must be positive."
+    wanted = (brand.lower(), model.lower(), ref.lower())
+    for existing in db.list_watches():
+        if (existing["brand"].lower(), existing["model"].lower(), (existing["reference_no"] or "").lower()) == wanted:
+            return f"Already tracking {_label(existing)} as [{existing['id']}]."
+    _confirm(
+        services, "add",
+        {"brand": brand, "model": model, "ref": ref, "target": target, "currency": currency},
+        f"Add {brand} {model} ({ref or 'no ref'}) with target {target:,.0f} {currency}?",
+    )
+    return None
+
+
+def propose_target(watch_id: int, price: float, services: Services) -> str | None:
+    """Ask the user to confirm a new target. Returns why not, or None once the button is sent."""
+    row = db.get_watch(watch_id)
+    if row is None:
+        return f"No watch with id {watch_id}. See /list."
+    if price <= 0:
+        return "The target price must be positive."
+    _confirm(
+        services, "target", {"id": watch_id, "price": price},
+        f"Change the target for {_label(row)} from {row['target_price']:,.0f} to {price:,.0f} {row['currency']}?",
+    )
+    return None
+
+
+def propose_remove(watch_id: int, services: Services) -> str | None:
+    """Ask the user to confirm removing a watch. Returns why not, or None once the button is sent."""
+    row = db.get_watch(watch_id)
+    if row is None:
+        return f"No watch with id {watch_id}. See /list."
+    _confirm(
+        services, "remove", {"id": row["id"]},
+        f"Stop tracking {_label(row)}? This also deletes its price history, checks and notes.",
+    )
+    return None
+
+
 def cmd_add(args: str, services: Services) -> None:
     parts = [p.strip() for p in args.split("|")]
     if len(parts) not in (4, 5) or not parts[0] or not parts[1]:
@@ -164,43 +219,28 @@ def cmd_add(args: str, services: Services) -> None:
     if target is None:
         services.send(f"'{target_text}' isn't a valid target price.")
         return
-    for existing in db.list_watches():
-        if (existing["brand"].lower(), existing["model"].lower(), (existing["reference_no"] or "").lower()) \
-                == (brand.lower(), model.lower(), ref.lower()):
-            services.send(f"Already tracking {_label(existing)} as [{existing['id']}].")
-            return
-    _confirm(
-        services, "add",
-        {"brand": brand, "model": model, "ref": ref, "target": target, "currency": currency},
-        f"Add {brand} {model} ({ref or 'no ref'}) with target {target:,.0f} {currency}?",
-    )
+    if error := propose_add(brand, model, ref, target, currency, services):
+        services.send(error)
 
 
 def cmd_target(args: str, services: Services) -> None:
     words = args.split()
-    watch_id = _parse_id(words[0]) if words else None
+    watch_id = _first_id(args)
     price = _parse_price(words[1]) if len(words) == 2 else None
     if watch_id is None or price is None:
         services.send("Usage: /target <id> <price>, e.g. /target 1 13500")
         return
-    row = db.get_watch(watch_id)
-    if row is None:
-        services.send(f"No watch with id {watch_id}. See /list.")
-        return
-    _confirm(
-        services, "target", {"id": watch_id, "price": price},
-        f"Change the target for {_label(row)} from {row['target_price']:,.0f} to {price:,.0f} {row['currency']}?",
-    )
+    if error := propose_target(watch_id, price, services):
+        services.send(error)
 
 
 def cmd_remove(args: str, services: Services) -> None:
-    row = _find_watch(args, services)
-    if row is None:
+    watch_id = _first_id(args)
+    if watch_id is None:
+        services.send("Usage: /remove <id>, e.g. /remove 1 (see /list)")
         return
-    _confirm(
-        services, "remove", {"id": row["id"]},
-        f"Stop tracking {_label(row)}? This also deletes its price history and checks.",
-    )
+    if error := propose_remove(watch_id, services):
+        services.send(error)
 
 
 COMMANDS: dict[str, Callable[[str, Services], None]] = {
@@ -216,7 +256,7 @@ COMMANDS: dict[str, Callable[[str, Services], None]] = {
 }
 
 
-# --- confirmations ------------------------------------------------------------
+# --- confirm / cancel button taps ---------------------------------------------
 
 def _execute(action: str, payload: dict) -> str:
     if action == "add":
@@ -286,7 +326,7 @@ def handle_update(update: dict, services: Services, allowed_chat_id: int) -> Non
         handle_text(message["text"].strip(), services)
 
 
-# --- free-text questions ------------------------------------------------------
+# --- free-text messages: the conversational assistant ------------------------
 
 @tool
 def get_watchlist_status() -> str:
@@ -318,39 +358,112 @@ def get_check_history(watch_id: int) -> str:
     )
 
 
-def answer_question(question: str) -> str:
-    """One-shot, read-only Q&A over the stored checks. It has no tool that can write."""
-    from langchain.agents import create_agent
-    from langchain_google_genai import ChatGoogleGenerativeAI
+_PROPOSED = "Sent the user a Confirm button. Nothing changes until they tap it."
 
-    from watchagent.config import require_api_keys
+
+@tool
+def propose_add_watch(brand: str, model: str, reference: str, target_price: float,
+                      runtime: ToolRuntime[Services], currency: str = "USD") -> str:
+    """Ask the user to confirm adding a watch to the watchlist.
+
+    Args:
+        brand: e.g. "Tudor"
+        model: e.g. "Black Bay 58"
+        reference: Reference number, e.g. "M79030N-0001"; "" if unknown
+        target_price: The price the user would buy at
+        currency: ISO code, default USD
+    """
+    return propose_add(brand, model, reference, target_price, currency.upper(), runtime.context) \
+        or _PROPOSED
+
+
+@tool
+def propose_new_target(watch_id: int, target_price: float, runtime: ToolRuntime[Services]) -> str:
+    """Ask the user to confirm changing a watch's target price.
+
+    Args:
+        watch_id: The watch id from get_watchlist_status
+        target_price: The new target price
+    """
+    return propose_target(watch_id, target_price, runtime.context) or _PROPOSED
+
+
+@tool
+def propose_removal(watch_id: int, runtime: ToolRuntime[Services]) -> str:
+    """Ask the user to confirm removing a watch from the watchlist.
+
+    Args:
+        watch_id: The watch id from get_watchlist_status
+    """
+    return propose_remove(watch_id, runtime.context) or _PROPOSED
+
+
+@tool
+def research_price(watch_id: int, runtime: ToolRuntime[Services]) -> str:
+    """Run a fresh price check on a watch (about a minute) and return the result with its verdict.
+
+    Args:
+        watch_id: The watch id from get_watchlist_status
+    """
+    row = db.get_watch(watch_id)
+    if row is None:
+        return f"No watch with id {watch_id}."
+    try:
+        return runtime.context.check(row).message()
+    except Exception as e:
+        return f"The check failed: {e}"
+
+
+ASSISTANT_TOOLS = [get_watchlist_status, get_check_history, research_price,
+                   propose_add_watch, propose_new_target, propose_removal]
+
+
+def run_assistant(text: str, services: Services) -> str:
+    """Answer a free-text message. The assistant can read and research, but only *propose* changes."""
+    from langchain.agents import create_agent
+    from langchain.agents.middleware import ModelCallLimitMiddleware, ModelRetryMiddleware
+
+    from watchagent.agent import make_model, request_budget, retry_on
+    from watchagent.config import DAILY_REQUEST_LIMIT
 
     require_api_keys()
     agent = create_agent(
-        model=ChatGoogleGenerativeAI(model=GEMINI_MODEL),
-        tools=[get_watchlist_status, get_check_history],
-        system_prompt=QA_PROMPT,
+        model=make_model(LLM_MODEL),
+        tools=ASSISTANT_TOOLS,
+        system_prompt=ASSISTANT_PROMPT,
+        context_schema=Services,
+        middleware=[ModelRetryMiddleware(max_retries=3, initial_delay=5, on_failure="error", retry_on=retry_on),
+                    ModelCallLimitMiddleware(run_limit=10, exit_behavior="end"),
+                    request_budget(DAILY_REQUEST_LIMIT)],
     )
-    result = agent.invoke({"messages": [{"role": "user", "content": question}]},
-                          config={"recursion_limit": 12})
-    return result["messages"][-1].text or "I couldn't work out an answer."
+    history = [{"role": role, "content": content} for role, content in db.recent_chat(CHAT_MEMORY)]
+    result = agent.invoke({"messages": history + [{"role": "user", "content": text}]},
+                          config={"recursion_limit": 30}, context=services)
+    reply = result["messages"][-1].text or "I couldn't work out an answer."
+    db.add_chat("user", text)
+    db.add_chat("assistant", reply)
+    return reply
 
 
 # --- entry point --------------------------------------------------------------
 
+@lru_cache(maxsize=1)
+def _research_agent():
+    """Built on the first /check only, then reused."""
+    from watchagent.agent import build_agent
+    return build_agent()
+
+
 def default_services() -> Services:
     from watchagent import notify
 
-    agent_cache: list = []
+    from watchagent.agent import check_watch
 
-    def check(row):
-        from watchagent.agent import build_agent, check_watch
-        if not agent_cache:
-            agent_cache.append(build_agent())
-        return check_watch(agent_cache[0], row)
-
-    return Services(send=notify.send_telegram, answer_callback=notify.answer_callback,
-                    check=check, answer=answer_question)
+    services = Services(send=notify.send_telegram, answer_callback=notify.answer_callback,
+                        check=lambda row: check_watch(_research_agent(), row), answer=lambda text: "")
+    # The assistant needs the finished Services (to send Confirm buttons), so it is wired in last.
+    services.answer = lambda text: run_assistant(text, services)
+    return services
 
 
 def run_once(services: Services | None = None) -> int:

@@ -1,3 +1,4 @@
+"""SQLite storage: the watchlist, price history, checks, research notes and bot state."""
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -54,6 +55,20 @@ CREATE TABLE IF NOT EXISTS pending_actions (
     created_at TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
 );
+
+CREATE TABLE IF NOT EXISTS watch_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    watch_id INTEGER NOT NULL REFERENCES watches(id),
+    note TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chat_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 # Columns added after the first release: (table, column, DDL type).
@@ -67,13 +82,17 @@ _ADDED_COLUMNS = [
 
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
         conn.commit()
     finally:
         conn.close()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def init_db() -> None:
@@ -88,6 +107,8 @@ def init_db() -> None:
             "ON watches (brand, model, COALESCE(reference_no, ''))"
         )
 
+
+# --- watches ------------------------------------------------------------------
 
 def add_watch(brand: str, model: str, target_price: float, reference_no: str = "",
               currency: str = "USD", notes: str = "") -> int:
@@ -115,6 +136,34 @@ def get_watch(watch_id: int) -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM watches WHERE id = ?", (watch_id,)).fetchone()
 
 
+def update_target(watch_id: int, target_price: float) -> bool:
+    if target_price <= 0:
+        raise ValueError("target price must be positive")
+    with get_conn() as conn:
+        cur = conn.execute("UPDATE watches SET target_price = ? WHERE id = ?", (target_price, watch_id))
+        return cur.rowcount > 0
+
+
+def mark_alerted(watch_id: int, price: float) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE watches SET last_alerted_at = ?, last_alerted_price = ? WHERE id = ?",
+            (_now(), price, watch_id),
+        )
+
+
+def remove_watch(watch_id: int) -> bool:
+    """Delete a watch and everything recorded about it."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM checks WHERE watch_id = ?", (watch_id,))
+        conn.execute("DELETE FROM price_history WHERE watch_id = ?", (watch_id,))
+        conn.execute("DELETE FROM watch_notes WHERE watch_id = ?", (watch_id,))
+        cur = conn.execute("DELETE FROM watches WHERE id = ?", (watch_id,))
+        return cur.rowcount > 0
+
+
+# --- prices and checks --------------------------------------------------------
+
 def record_price(watch_id: int, price: float, currency: str,
                   source_url: str = "", snippet: str = "",
                   run_id: str = "", source: str = "") -> int:
@@ -124,9 +173,17 @@ def record_price(watch_id: int, price: float, currency: str,
             "(watch_id, price, currency, source_url, snippet, fetched_at, run_id, source) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (watch_id, price, currency, source_url, snippet,
-             datetime.now(timezone.utc).isoformat(), run_id, source),
+             _now(), run_id, source),
         )
         return cur.lastrowid
+
+
+def get_price_history(watch_id: int, limit: int = 20) -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM price_history WHERE watch_id = ? ORDER BY fetched_at DESC LIMIT ?",
+            (watch_id, limit),
+        ).fetchall()
 
 
 def record_check(watch_id: int, run_id: str, price: float, currency: str,
@@ -138,53 +195,10 @@ def record_check(watch_id: int, run_id: str, price: float, currency: str,
             "INSERT INTO checks (watch_id, run_id, checked_at, price, currency, confidence, "
             "sources, verdict, pct_vs_target, trend_pct, reasoning) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (watch_id, run_id, datetime.now(timezone.utc).isoformat(), price, currency,
+            (watch_id, run_id, _now(), price, currency,
              confidence, sources, verdict, pct_vs_target, trend_pct, reasoning),
         )
         return cur.lastrowid
-
-
-def prior_check_prices(watch_id: int, limit: int = 5) -> list[float]:
-    """Prices from earlier checks of this watch, newest first."""
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT price FROM checks WHERE watch_id = ? ORDER BY checked_at DESC, id DESC LIMIT ?",
-            (watch_id, limit),
-        ).fetchall()
-    return [r["price"] for r in rows]
-
-
-def latest_check(watch_id: int) -> sqlite3.Row | None:
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM checks WHERE watch_id = ? ORDER BY checked_at DESC, id DESC LIMIT 1",
-            (watch_id,),
-        ).fetchone()
-
-
-def get_price_history(watch_id: int, limit: int = 20) -> list[sqlite3.Row]:
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM price_history WHERE watch_id = ? ORDER BY fetched_at DESC LIMIT ?",
-            (watch_id, limit),
-        ).fetchall()
-
-
-def update_target(watch_id: int, target_price: float) -> bool:
-    if target_price <= 0:
-        raise ValueError("target price must be positive")
-    with get_conn() as conn:
-        cur = conn.execute("UPDATE watches SET target_price = ? WHERE id = ?", (target_price, watch_id))
-        return cur.rowcount > 0
-
-
-def remove_watch(watch_id: int) -> bool:
-    """Delete a watch and everything recorded about it."""
-    with get_conn() as conn:
-        conn.execute("DELETE FROM checks WHERE watch_id = ?", (watch_id,))
-        conn.execute("DELETE FROM price_history WHERE watch_id = ?", (watch_id,))
-        cur = conn.execute("DELETE FROM watches WHERE id = ?", (watch_id,))
-        return cur.rowcount > 0
 
 
 def recent_checks(watch_id: int, limit: int = 10) -> list[sqlite3.Row]:
@@ -194,6 +208,58 @@ def recent_checks(watch_id: int, limit: int = 10) -> list[sqlite3.Row]:
             (watch_id, limit),
         ).fetchall()
 
+
+def latest_check(watch_id: int) -> sqlite3.Row | None:
+    checks = recent_checks(watch_id, 1)
+    return checks[0] if checks else None
+
+
+def prior_check_prices(watch_id: int, limit: int = 5) -> list[float]:
+    """Prices from earlier checks of this watch, newest first."""
+    return [r["price"] for r in recent_checks(watch_id, limit)]
+
+
+# --- research notes -----------------------------------------------------------
+
+def add_note(watch_id: int, note: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO watch_notes (watch_id, note, created_at) VALUES (?, ?, ?)",
+            (watch_id, note, _now()),
+        )
+
+
+def recent_notes(watch_id: int, limit: int = 5) -> list[str]:
+    """The research agent's notes on this watch, oldest first."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT note FROM watch_notes WHERE watch_id = ? ORDER BY id DESC LIMIT ?",
+            (watch_id, limit),
+        ).fetchall()
+    return [r["note"] for r in reversed(rows)]
+
+
+# --- model request budget -----------------------------------------------------
+# One counter per UTC day in bot_state, e.g. "llm_requests:2026-09-23" -> "17".
+
+def _requests_key() -> str:
+    return "llm_requests:" + datetime.now(timezone.utc).date().isoformat()
+
+
+def llm_requests_today() -> int:
+    return int(get_state(_requests_key()) or 0)
+
+
+def count_llm_request() -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO bot_state (key, value) VALUES (?, '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+            (_requests_key(),),
+        )
+
+
+# --- Telegram bot: offset, pending confirmations, chat memory -----------------
 
 def get_state(key: str) -> str | None:
     with get_conn() as conn:
@@ -215,7 +281,7 @@ def create_pending(action: str, payload: dict) -> int:
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO pending_actions (action, payload, created_at) VALUES (?, ?, ?)",
-            (action, json.dumps(payload), datetime.now(timezone.utc).isoformat()),
+            (action, json.dumps(payload), _now()),
         )
         return cur.lastrowid
 
@@ -236,9 +302,16 @@ def resolve_pending(pending_id: int, status: str) -> tuple[str, dict, str] | Non
         return row["action"], json.loads(row["payload"]), row["created_at"]
 
 
-def mark_alerted(watch_id: int, price: float) -> None:
+def add_chat(role: str, content: str) -> None:
     with get_conn() as conn:
         conn.execute(
-            "UPDATE watches SET last_alerted_at = ?, last_alerted_price = ? WHERE id = ?",
-            (datetime.now(timezone.utc).isoformat(), price, watch_id),
+            "INSERT INTO chat_log (role, content, created_at) VALUES (?, ?, ?)",
+            (role, content, _now()),
         )
+
+
+def recent_chat(limit: int = 12) -> list[tuple[str, str]]:
+    """The last `limit` Telegram messages as (role, content), oldest first."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT role, content FROM chat_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [(r["role"], r["content"]) for r in reversed(rows)]
