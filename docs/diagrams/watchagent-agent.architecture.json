@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "WatchAgent: agentic price research",
+    "locale": "en",
+    "quality_profile": "showcase"
+  },
+  "components": [
+    { "id": "actions", "type": "cloud", "label": "GitHub Actions", "sublabel": "check every 6h", "brand": "github-actions", "pos": [40, 300], "size": [140, 64] },
+    { "id": "cli", "type": "backend", "label": "watchagent check", "sublabel": "stalest-first, 3 at a time", "pos": [250, 300], "size": [150, 64] },
+    { "id": "agent", "type": "backend", "label": "Research agent", "sublabel": "LangChain create_agent", "pos": [480, 300], "size": [150, 64], "tag": "loops until 3 listings" },
+    { "id": "checks", "type": "security", "label": "Listing checks", "sublabel": "grounded, ref, outliers", "pos": [710, 300], "size": [150, 64], "tag": "code, not LLM" },
+    { "id": "db", "type": "database", "label": "watches.db", "sublabel": "prices, checks, notes", "brand": "sqlite", "pos": [940, 300], "size": [150, 64] },
+    { "id": "tavily", "type": "external", "label": "Tavily", "sublabel": "search + page extract", "pos": [250, 110], "size": [150, 64] },
+    { "id": "guardrails", "type": "security", "label": "Model middleware", "sublabel": "retry, fallback, budget", "pos": [480, 110], "size": [150, 64] },
+    { "id": "gemini", "type": "external", "label": "Gemini API", "sublabel": "flash-lite, flash fallback", "brand": "google-gemini", "pos": [710, 110], "size": [150, 64] },
+    { "id": "telegram", "type": "external", "label": "Telegram", "sublabel": "your chat", "brand": "telegram", "pos": [250, 490], "size": [150, 64] },
+    { "id": "assistant", "type": "backend", "label": "Telegram assistant", "sublabel": "read, research, propose", "pos": [480, 490], "size": [150, 64] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "watchagent package", "wraps": ["cli", "agent", "checks", "db"] }
+  ],
+  "connections": [
+    { "id": "schedule", "from": "actions", "to": "cli", "label": "cron", "variant": "emphasis" },
+    { "id": "research", "from": "cli", "to": "agent", "label": "per watch", "variant": "emphasis" },
+    { "id": "submit", "from": "agent", "to": "checks", "label": "submit listings", "variant": "emphasis" },
+    { "id": "record", "from": "checks", "to": "db", "label": "median price", "variant": "emphasis" },
+    { "id": "search", "from": "agent", "to": "tavily", "label": "search / open", "fromSide": "top", "toSide": "bottom" },
+    { "id": "model-call", "from": "agent", "to": "guardrails", "label": "every model call", "variant": "security", "labelDx": 50 },
+    { "id": "llm", "from": "guardrails", "to": "gemini" },
+    { "id": "alert", "from": "cli", "to": "telegram", "label": "BUY alert", "variant": "dashed", "labelDy": 24 },
+    { "id": "chat", "from": "telegram", "to": "assistant", "label": "messages" },
+    { "id": "delegate", "from": "assistant", "to": "agent", "label": "research_price" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Agentic loop", "items": ["Agent searches, opens pages and submits listings", "Code replies with what it accepted, rejected and still needs", "Per-watch notes carry what worked into the next check"] },
+    { "dot": "rose", "title": "Code decides", "items": ["Price must be written in real search text, for the exact reference", "Median of 3+ listings, outliers dropped", "BUY / WAIT / OVERPRICED computed, not generated"] },
+    { "dot": "amber", "title": "Guardrails", "items": ["Must research before answering", "Daily request budget: scheduled share, bot keeps the rest", "Assistant only proposes changes; a Confirm tap applies them"] }
+  ]
+}
