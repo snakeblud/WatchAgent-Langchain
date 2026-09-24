@@ -66,3 +66,63 @@ def test_alert_history_without_a_price_falls_back_to_the_cooldown():
 
 def test_a_buy_backed_by_too_few_listings_does_not_alert():
     assert not should_alert(row(), result(listings=2), 48, NOW)
+
+
+# --- run summary ------------------------------------------------------------
+
+def checked(verdict):
+    return SimpleNamespace(verdict=SimpleNamespace(verdict=verdict))
+
+
+def watch(i, brand="Rolex", model="Sub"):
+    return {"id": i, "brand": brand, "model": model}
+
+
+def test_summary_counts_verdicts_and_names_failures_and_skips():
+    from watchagent.agent import DailyBudgetExceeded
+    from watchagent.cli import run_summary
+
+    rows = [watch(1), watch(2), watch(3), watch(4, "Omega", "Speedmaster"), watch(5, "Grand Seiko", "Snowflake")]
+    outcomes = [checked("WAIT"), checked("OVERPRICED"), checked("OVERPRICED"),
+                RuntimeError("Error calling model (RESOURCE_EXHAUSTED): 429 quota"),
+                DailyBudgetExceeded("used up")]
+    assert run_summary(rows, outcomes) == (
+        "WatchAgent check: 3 of 5 watches checked\n"
+        "WAIT 1 · OVERPRICED 2\n"
+        "Failed (1):\n"
+        "- Omega Speedmaster: AI quota used up\n"
+        "Skipped, daily AI budget used up (1): Grand Seiko Snowflake"
+    )
+
+
+def test_summary_when_every_check_fails():
+    from watchagent.cli import run_summary
+
+    text = run_summary([watch(1)], [RuntimeError("503 UNAVAILABLE")])
+    assert text == "WatchAgent check: 0 of 1 watches checked\nFailed (1):\n- Rolex Sub: AI service busy"
+
+
+@pytest.mark.parametrize("message,reason", [
+    ("Error calling model 'gemini-3.5-flash' (RESOURCE_EXHAUSTED): 429", "AI quota used up"),
+    ("503 UNAVAILABLE. This model is currently experiencing high demand", "AI service busy"),
+    ("the agent finished without any listing that passed the checks", "no usable listing found"),
+    ("something else\nwith detail", "something else"),
+])
+def test_failure_reasons_are_plain(message, reason):
+    from watchagent.cli import _failure_reason
+
+    assert _failure_reason(RuntimeError(message)) == reason
+
+
+def test_summary_is_sent_only_when_notifying(monkeypatch):
+    from watchagent import agent as agent_mod, cli, notify
+
+    sent = []
+    monkeypatch.setattr(agent_mod, "check_watch", lambda _agent, row: SimpleNamespace(
+        watch="Rolex Sub", price=1.0, currency="USD", target_price=1.0, listings=3,
+        verdict=SimpleNamespace(verdict="WAIT", trend_pct=None), confidence_label="3 listings", explanation="x"))
+    monkeypatch.setattr(notify, "send_telegram", sent.append)
+    cli._run_checks(None, [watch(1)], notify=False, cooldown_hours=48)
+    assert sent == []
+    cli._run_checks(None, [watch(1)], notify=True, cooldown_hours=48)
+    assert sent == ["WatchAgent check: 1 of 1 watches checked\nWAIT 1"]

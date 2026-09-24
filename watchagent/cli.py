@@ -2,6 +2,7 @@
 import argparse
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -116,7 +117,48 @@ def _run_checks(agent, rows, notify: bool, cooldown_hours: float) -> int:
                 print(f"  (alert failed: {e})", file=sys.stderr)
     if skipped:
         print(f"{skipped} watch(es) skipped: today's model request budget is used up.")
+    if notify:
+        # Always report the round, so a quiet chat never hides failed checks.
+        from watchagent.notify import send_telegram
+        try:
+            send_telegram(run_summary(rows, outcomes))
+        except Exception as e:
+            print(f"  (summary failed: {e})", file=sys.stderr)
     return failures
+
+
+def _failure_reason(exc: Exception) -> str:
+    """A short, plain reason for a failed check, for the Telegram summary."""
+    text = str(exc)
+    if "RESOURCE_EXHAUSTED" in text or "429" in text:
+        return "AI quota used up"
+    if "UNAVAILABLE" in text or "503" in text:
+        return "AI service busy"
+    if "without any listing" in text:
+        return "no usable listing found"
+    return text.splitlines()[0][:80] if text else type(exc).__name__
+
+
+def run_summary(rows, outcomes) -> str:
+    """One Telegram message describing a check round, failures included."""
+    from watchagent.agent import DailyBudgetExceeded
+
+    pairs = list(zip(rows, outcomes))
+    checked = [r for _, r in pairs if not isinstance(r, Exception)]
+    skipped = [row for row, r in pairs if isinstance(r, DailyBudgetExceeded)]
+    failed = [(row, r) for row, r in pairs if isinstance(r, Exception) and not isinstance(r, DailyBudgetExceeded)]
+
+    lines = [f"WatchAgent check: {len(checked)} of {len(rows)} watches checked"]
+    counts = Counter(r.verdict.verdict for r in checked)
+    if checked:
+        lines.append(" · ".join(f"{v} {counts[v]}" for v in ("BUY", "WAIT", "OVERPRICED") if counts[v]))
+    if failed:
+        lines.append(f"Failed ({len(failed)}):")
+        lines += [f"- {row['brand']} {row['model']}: {_failure_reason(e)}" for row, e in failed]
+    if skipped:
+        lines.append(f"Skipped, daily AI budget used up ({len(skipped)}): "
+                     + ", ".join(f"{row['brand']} {row['model']}" for row in skipped))
+    return "\n".join(lines)
 
 
 def cmd_check(args: argparse.Namespace) -> None:
