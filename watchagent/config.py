@@ -24,7 +24,7 @@ SEARCH_SNIPPET_CHARS = int(os.environ.get("SEARCH_SNIPPET_CHARS",
 # stays free for the Telegram bot's /check and questions. The defaults sit above
 # the ~240/day the old 4x-daily schedule used on the free tier without hitting a
 # quota; lower them if Google's free-tier limits for your models are tighter.
-DAILY_REQUEST_LIMIT = int(os.environ.get("DAILY_REQUEST_LIMIT", "300"))
+DAILY_REQUEST_LIMIT = int(os.environ.get("DAILY_REQUEST_LIMIT") or "300")  # `or`: CI passes unset as ""
 SCHEDULED_REQUEST_SHARE = int(os.environ.get("SCHEDULED_REQUEST_SHARE", "250"))
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
