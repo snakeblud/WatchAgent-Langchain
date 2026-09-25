@@ -167,7 +167,7 @@ def test_invented_url_snippet_or_price_is_rejected(ctx):
                  listing(URLS[0], 9000, snippet="Brand new $9,000"),
                  listing(URLS[1], 14000, snippet="Unworn $15,600"))
     assert "not in the search_watch_price results" in out
-    assert "not text from that search result" in out
+    assert "not an exact copy of one piece of text" in out
     assert "not stated as a USD amount" in out
     assert ctx.accepted == []
 
@@ -210,6 +210,16 @@ def test_open_listing_only_opens_search_results(ctx, monkeypatch):
     assert out == "Listing A $15,300\nListing B $15,350"
     # Prices read from the opened page can now be submitted.
     assert "Accepted 1" in submit(ctx, listing(URLS[0], 15350, snippet="Listing B $15,350"))
+    # A repeat open reuses the first result instead of fetching the page again.
+    monkeypatch.setattr(tools, "_extractor", lambda: pytest.fail("page fetched twice"))
+    assert tools.open_listing.func(url=URLS[0], runtime=runtime).endswith(out)
+
+
+def test_rejected_snippet_shows_text_that_would_pass(ctx):
+    out = submit(ctx, listing(URLS[0], 15200, snippet="Submariner, $15,200 (paraphrased)"))
+    hint = out.split('e.g. "')[1].split('"')[0]
+    assert "$15,200" in hint
+    assert "Accepted 1" in submit(ctx, listing(URLS[0], 15200, snippet=hint))
 
 
 def test_save_note_is_bound_to_the_watch(ctx):

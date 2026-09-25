@@ -13,17 +13,21 @@ from langchain.agents.middleware import (
 from langchain.agents.middleware.model_retry import default_retry_on
 from langchain.agents.structured_output import ToolStrategy
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from pydantic import BaseModel, Field
 
 from watchagent import db
-from watchagent.config import DAILY_REQUEST_LIMIT, LLM_FALLBACK_MODELS, LLM_MODEL, require_api_keys
+from watchagent.config import (
+    DAILY_REQUEST_LIMIT, GOOGLE_API_KEY, GROQ_API_KEY, LLM_FALLBACK_MODELS, LLM_MODEL, require_api_keys,
+)
 from watchagent.tools import ALL_TOOLS, MIN_LISTINGS, WatchContext, finalize
 from watchagent.verdict import TREND_WINDOW, Verdict, compute_verdict, describe_trend
 
 MAX_SEARCHES = 6
 MAX_PAGE_OPENS = 4
 # Kept low: on the free tier every model call comes out of a 50-a-day budget.
-MAX_MODEL_CALLS = 10
+# Groq models need more turns: they often get a listing rejected and have to resubmit.
+MAX_MODEL_CALLS = 10 if LLM_MODEL.startswith("gemini") else 16
 MODEL_TIMEOUT_SECONDS = 90
 
 SYSTEM_PROMPT = f"""You are a luxury watch price researcher. Your goal: find the
@@ -87,13 +91,25 @@ class CheckResult:
         )
 
 
-def make_model(name: str, **settings) -> ChatGoogleGenerativeAI:
-    """A Gemini chat model. Extra `settings` (e.g. thinking_budget=0) go to the client.
+def make_model(name: str, **settings):
+    """A chat model: Gemini if `name` starts with "gemini", else Groq. Extra `settings`
+    (e.g. thinking_budget=0 for Gemini) go to the client.
 
     Retries are left to ModelRetryMiddleware: the client's own defaults (no
     timeout, 6 retries) once hung a CI run for 40 minutes.
     """
-    return ChatGoogleGenerativeAI(model=name, timeout=MODEL_TIMEOUT_SECONDS, max_retries=0, **settings)
+    if name.startswith("gemini"):
+        return ChatGoogleGenerativeAI(model=name, timeout=MODEL_TIMEOUT_SECONDS, max_retries=0, **settings)
+    return ChatGroq(model=name, api_key=GROQ_API_KEY, timeout=MODEL_TIMEOUT_SECONDS, max_retries=0, **settings)
+
+
+def fallback_models() -> list:
+    """The fallbacks, skipping any whose provider has no key. Gemini ones run with thinking off."""
+    return [
+        make_model(m, **({"thinking_budget": 0} if m.startswith("gemini") else {}))
+        for m in LLM_FALLBACK_MODELS
+        if (GOOGLE_API_KEY if m.startswith("gemini") else GROQ_API_KEY)
+    ]
 
 
 class DailyBudgetExceeded(RuntimeError):
@@ -144,7 +160,7 @@ def build_agent(daily_limit: int = DAILY_REQUEST_LIMIT):
             ModelRetryMiddleware(max_retries=3, initial_delay=10, max_delay=60, on_failure="error",
                                  retry_on=retry_on),
             # Thinking off: with it on, gemini-3.5-flash took 24-77s per call instead of ~2s.
-            ModelFallbackMiddleware(*[make_model(m, thinking_budget=0) for m in LLM_FALLBACK_MODELS]),
+            ModelFallbackMiddleware(*fallback_models()),
             ModelCallLimitMiddleware(run_limit=MAX_MODEL_CALLS, exit_behavior="end"),
             ToolCallLimitMiddleware(tool_name="search_watch_price", run_limit=MAX_SEARCHES),
             ToolCallLimitMiddleware(tool_name="open_listing", run_limit=MAX_PAGE_OPENS),

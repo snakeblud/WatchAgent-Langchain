@@ -18,6 +18,7 @@ from langchain_tavily import TavilyExtract, TavilySearch
 from pydantic import BaseModel, Field
 
 from watchagent import db
+from watchagent.config import SEARCH_SNIPPET_CHARS
 
 # A check records a price once this many listings of the right reference agree.
 MIN_LISTINGS = 3
@@ -26,7 +27,8 @@ OUTLIER_PCT = 25.0
 # A submitted price must be within this fraction of an amount written in its snippet.
 GROUNDING_TOLERANCE = 0.01
 # How many price lines of an opened page the model gets to see.
-MAX_PAGE_LINES = 60
+# Fewer when search snippets are trimmed too: both keep requests under Groq's free-tier size cap.
+MAX_PAGE_LINES = 15 if SEARCH_SNIPPET_CHARS else 60
 
 _SOURCE_DOMAINS: dict[str, list[str] | None] = {
     "chrono24": ["chrono24.com"],
@@ -94,6 +96,8 @@ class WatchContext:
     reference_no: str = ""
     # url -> every text the model was shown for it (search result, then any opened page)
     search_results: dict[str, str] = field(default_factory=dict)
+    # url -> what open_listing returned, so a repeat open doesn't fetch the page again
+    opened: dict[str, str] = field(default_factory=dict)
     accepted: list[Listing] = field(default_factory=list)
     recorded: RecordedPrice | None = None
 
@@ -191,6 +195,16 @@ def _same_reference(seen: str, wanted: str) -> bool:
     return seen.startswith(wanted) or wanted.startswith(seen)
 
 
+def _quote_hint(text: str, price: float, currency: str) -> str | None:
+    """A short piece of `text` around an amount matching `price`: a snippet that would pass. Weaker models
+    tend to paraphrase or stitch text together, and showing them the exact text fixes it."""
+    for pattern in _amount_patterns(currency):
+        for match in pattern.finditer(text):
+            if _price_is_grounded(price, match.group(0), currency):
+                return " ".join(text[max(0, match.start() - 60):match.end()].split())
+    return None
+
+
 def _listing_error(ctx: WatchContext, listing: Listing) -> str | None:
     """Why this listing can't be trusted, or None if it checks out."""
     if listing.price <= 0:
@@ -200,7 +214,9 @@ def _listing_error(ctx: WatchContext, listing: Listing) -> str | None:
         known = ", ".join(list(ctx.search_results)[:8])
         return f"source_url was not in the search_watch_price results (copy one exactly: {known})"
     if not listing.snippet.strip() or _normalize(listing.snippet) not in _normalize(text):
-        return "snippet is not text from that search result or page"
+        hint = _quote_hint(text, listing.price, ctx.currency)
+        return ("snippet is not an exact copy of one piece of text from that result or page"
+                + (f'; copy it verbatim, e.g. "{hint}"' if hint else ""))
     if not _price_is_grounded(listing.price, listing.snippet, ctx.currency):
         return f"price is not stated as a {ctx.currency} amount in the snippet"
     wanted = _ref_key(ctx.reference_no)
@@ -262,10 +278,13 @@ def search_watch_price(query: str, runtime: ToolRuntime[WatchContext], source: s
         if not isinstance(item, dict):
             continue
         url = item.get("url", "")
-        line = f"- {item.get('title', '')} ({url}): {item.get('content', '')}"
+        content = item.get("content", "")
+        line = f"- {item.get('title', '')} ({url}): {content}"
         # Remembered so submitted listings can be checked against what was really shown.
         runtime.context.search_results[url] = line
-        lines.append(line)
+        # The model sees a trimmed snippet, so any text it quotes is still inside the full one stored above.
+        limit = SEARCH_SNIPPET_CHARS
+        lines.append(f"- {item.get('title', '')} ({url}): {content[:limit]}" if limit else line)
     return "\n".join(lines) if lines else f"No results found for source={source}."
 
 
@@ -283,15 +302,18 @@ def open_listing(url: str, runtime: ToolRuntime[WatchContext]) -> str:
     ctx = runtime.context
     if url not in ctx.search_results:
         return "ERROR: only URLs returned by search_watch_price can be opened."
+    if url in ctx.opened:
+        return ("You already opened this page; opening it again shows nothing new. It said:\n"
+                + ctx.opened[url])
     results = _extractor().invoke({"urls": [url]}).get("results") or []
     page = (results[0].get("raw_content") or "") if results else ""
     if not page:
         return "ERROR: could not read that page. Try another result."
     ctx.search_results[url] += "\n" + page
     price_lines = [line.strip() for line in page.splitlines() if _amounts_in_text(line, ctx.currency)]
-    if not price_lines:
-        return f"The page has no {ctx.currency} prices."
-    return "\n".join(price_lines[:MAX_PAGE_LINES])
+    out = "\n".join(price_lines[:MAX_PAGE_LINES]) if price_lines else f"The page has no {ctx.currency} prices."
+    ctx.opened[url] = out
+    return out
 
 
 @tool
