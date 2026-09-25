@@ -3,7 +3,12 @@ name: WatchAgent Check
 on:
   schedule:
     - cron: "0 */6 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      watch_id:
+        description: "Only check this watch id (blank = all). A single check may use the bot's share of the daily budget."
+        type: number
+        required: false
 
 permissions:
   contents: write
@@ -36,7 +41,8 @@ jobs:
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: uv run watchagent check --notify
+          WATCH_ID: ${{ inputs.watch_id }}
+        run: uv run watchagent check --notify ${WATCH_ID:+--id "$WATCH_ID"}
 
       # Runs even if a watch failed or the job timed out: the checks that
       # finished already wrote their prices and alert state.
